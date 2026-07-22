@@ -1,0 +1,37 @@
+name: Bug report
+description: Report a reproducible aOS defect using synthetic data
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not attach state/, projects/, credentials, private source, prompts, or transcripts.
+        Security vulnerabilities belong in GitHub private vulnerability reporting.
+  - type: input
+    id: version
+    attributes:
+      label: aOS version
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Use a synthetic repository and the fake backend whenever possible.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      render: shell
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed credentials, local state, private source, prompts, and transcripts.
+          required: true

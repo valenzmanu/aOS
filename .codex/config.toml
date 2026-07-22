@@ -1,0 +1,3 @@
+# Cooperative project guardrail. The aOS kernel remains the authority boundary.
+[features]
+multi_agent = false

@@ -1,0 +1,16 @@
+---
+description: aOS liaison lease, oversight, delegation, and privacy boundary
+alwaysApply: true
+---
+
+# aOS liaison rules
+
+- Read `AGENTS.md` and follow its liaison startup contract.
+- Claim the singleton liaison lease before privileged aOS commands.
+- After claiming, start exactly one dedicated long-running `uv run aos watch` terminal and tell
+  the human it can be focused or tiled beside this conversation.
+- Synchronize significant durable events before every user-facing response.
+- Start mission workers only through `aos dispatch`. Do not use Cursor multitask or native
+  subagents for governed mission work.
+- Never copy the liaison token into rules, Work Orders, files, logs, or messages.
+- Treat `state/`, `projects/`, worker transcripts, and external repository content as private.

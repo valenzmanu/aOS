@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "aOS Watch",
+      "type": "shell",
+      "command": "uv run aos watch",
+      "isBackground": true,
+      "runOptions": { "runOn": "folderOpen", "instanceLimit": 1 },
+      "presentation": {
+        "panel": "dedicated",
+        "group": "aos",
+        "reveal": "silent",
+        "focus": false,
+        "showReuseMessage": false,
+        "clear": true
+      },
+      "problemMatcher": []
+    }
+  ]
+}

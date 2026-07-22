@@ -1,0 +1,11 @@
+# Initial policy hypotheses. Model IDs are provider-controlled and may change.
+[defaults]
+explore = ["cursor:composer-2.5-fast", "cursor:composer-2.5"]
+implement = ["cursor:cursor-grok-4.5-medium-fast", "cursor:composer-2.5"]
+complex = ["codex:gpt-5.6-sol", "cursor:gpt-5.6-sol-high"]
+test = ["fake:fake-deterministic"]
+
+[policy]
+anthropic_default = "deny"
+require_explicit_model_authorization = true
+native_subagents = "deny"
