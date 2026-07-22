@@ -22,7 +22,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-cursor = ["cursor-sdk>=0.1.6,<0.2"]
+cursor = ["cursor-sdk>=1.0.24,<1.1"]
 dev = ["pytest>=8.3", "ruff>=0.11"]
 
 [project.scripts]
