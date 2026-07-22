@@ -14,8 +14,9 @@ A harness-agnostic control plane implementing the Agent OS Foundations document 
 > not a claim that every milestone has shipped. The implementation-status table in `README.md` is
 > authoritative for the current release. The durable kernel, fake backend, local Cursor/Codex CLI
 > adapters, optional Cursor Python SDK transport, worktrees, verification gate, watch UI, rules,
-> and public documentation are implemented. Cloud agents, quota accounting, retry-level APIs,
-> durable Codex Goals, and the complete recovery model remain roadmap work.
+> and public documentation are implemented. Durable retry levels, non-convergence, provider event
+> streaming, health-aware fallback, and restart reconstruction are also implemented. Cloud agents,
+> automatic quota accounting, durable Codex Goals, and vendor-session resume remain roadmap work.
 
 The human converses with the liaison as the control surface. In Cursor, the primary PoC surface is the **Agents Window**: after claiming the liaison lease, the liaison opens `aos watch` in a dedicated long-running agent terminal that can be focused or tiled beside the conversation. The liaison still synchronizes with the kernel before every user-facing turn so its decisions use current state, but it only interrupts the conversation for significant changes, blockers, failures, or work ready for approval. Full worker transcripts remain available for drill-down but do not flood the liaison's context.
 

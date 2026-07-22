@@ -29,8 +29,11 @@ truth about concurrent work. aOS supplies a small kernel around them:
 | Durable journal, leases, mission/process projections | Implemented and tested |
 | Fake backend end-to-end | Implemented and tested |
 | Git worktree isolation and verification gate | Implemented and tested |
-| Cursor local execution | Experimental CLI adapter; optional official Python SDK transport |
-| Codex local execution | Experimental adapter using the authenticated `codex exec` CLI |
+| Durable Contracts, Work Orders, Attempts, Sessions, inbox cursor | Implemented and tested |
+| Session / Process / Attempt retry and non-convergence | Implemented and tested |
+| Provider event streaming, usage capture, health-aware fallback | Implemented and tested |
+| Cursor local execution | Experimental; real Grok 4.5 Fast dogfood passed locally |
+| Codex local execution | Experimental; real GPT-5.6 Sol dogfood passed locally |
 | Cursor Python SDK transport | Implemented behind explicit opt-in; requires a Cursor API key |
 | Cursor cloud agents, provider quota ledger, Codex Goals | Planned, not implemented |
 | Hard prevention of harness-native subagents | Not possible at assurance level 1; rules are cooperative |
@@ -160,10 +163,13 @@ aos doctor                  validate setup without printing credential values
 aos liaison claim|sync|release
 aos mission create|authorize|view
 aos dispatch                route and spawn an isolated worker
+aos retry --level ...       retry at Session, Process, or Attempt scope
+aos signal <id> <action>    pause, resume, or cancel with liaison authority
 aos watch [--once]          read-only flight board; survives daemon restarts
 aos briefing                reconstruct active operational context
 aos events [--since N]      inspect the append-only journal
 aos recover                 mark expired workers orphaned
+aos provider status|discover|observe
 aos approve                 record human approval after verification
 aosd                        run lease/recovery supervision
 ```
@@ -180,4 +186,5 @@ uv run ruff check .
 uv run python scripts/check_public_tree.py
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). aOS is released under the [MIT License](LICENSE).
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md). aOS is released under the
+[MIT License](LICENSE).

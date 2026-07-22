@@ -5,6 +5,7 @@ import dataclasses
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 
 from .control import driver_command, run_verification
@@ -56,9 +57,112 @@ def run_cursor_sdk(store: Store, process_id: str, prompt: str, cwd: Path, model:
             print(json.dumps(event, default=json_default), flush=True)
         result = run.wait()
         print(json.dumps(result, default=json_default), flush=True)
+        result_usage = getattr(result, "usage", None)
+        if result_usage:
+            serialized_usage = json_default(result_usage)
+            if isinstance(serialized_usage, dict):
+                store.update_worker_session_metadata(process_id, {"usage": serialized_usage})
         status = str(result.status).lower()
         if not any(terminal in status for terminal in ("completed", "success", "finished")):
             raise StoreError(f"Cursor SDK run ended with status {result.status}")
+        store.observe_provider(
+            "cursor",
+            "healthy",
+            "cursor_python_sdk",
+            "estimated",
+            {"model": model},
+        )
+
+
+def fail_attempt_and_mission(store: Store, mission_id: str, attempt: int) -> None:
+    store.update_attempt_state(mission_id, attempt, "failed")
+    failed_attempts = sum(item["state"] == "failed" for item in store.attempts(mission_id))
+    target = "non_convergent" if failed_attempts >= 3 else "failed"
+    current = store.mission(mission_id)["state"]
+    if current in {"dispatched", "implementing", "verifying"}:
+        store.transition_mission(mission_id, target, {current})
+
+
+def stream_cli_driver(
+    store: Store,
+    process: dict[str, object],
+    process_id: str,
+    token: str,
+    command: list[str],
+    prompt: str,
+    cwd: Path,
+) -> None:
+    child = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=cwd,
+        bufsize=1,
+    )
+    assert child.stdin is not None
+    assert child.stdout is not None
+    child.stdin.write(prompt)
+    child.stdin.close()
+    backend_handle_recorded = False
+    last_heartbeat = time.monotonic()
+    tail: list[str] = []
+    usage: dict[str, object] = {}
+    for line in child.stdout:
+        print(line, end="", flush=True)
+        tail.append(line[-1000:])
+        tail = tail[-20:]
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            event = {}
+        handle = event.get("session_id")
+        if event.get("type") == "thread.started":
+            handle = event.get("thread_id")
+        if handle and not backend_handle_recorded:
+            store.set_process_session(process_id, str(handle))
+            backend_handle_recorded = True
+        event_usage = event.get("usage")
+        if isinstance(event_usage, dict):
+            usage.update(
+                {
+                    key: value
+                    for key, value in event_usage.items()
+                    if isinstance(value, (int, float))
+                }
+            )
+        if time.monotonic() - last_heartbeat >= 30:
+            checkpoint(
+                store,
+                process_id,
+                token,
+                "running",
+                phase="implementing",
+                current=f"provider event: {event.get('type', 'output')}",
+            )
+            last_heartbeat = time.monotonic()
+    return_code = child.wait()
+    if usage:
+        store.update_worker_session_metadata(process_id, {"usage": usage})
+    if return_code != 0:
+        error_tail = "\n".join(tail).lower()
+        limited = "rate limit" in error_tail or "quota" in error_tail or "usage limit" in error_tail
+        store.observe_provider(
+            str(process["backend"]),
+            "limited" if limited else "degraded",
+            "runtime_error",
+            "authoritative" if limited else "estimated",
+            {"exit_code": return_code, "model": process["model"]},
+        )
+        raise StoreError(f"{process['backend']} worker exited with {return_code}")
+    store.observe_provider(
+        str(process["backend"]),
+        "healthy",
+        "successful_run",
+        "estimated",
+        {"exit_code": return_code, "model": process["model"]},
+    )
 
 
 def run(home: Path, process_id: str, token: str) -> int:
@@ -68,20 +172,7 @@ def run(home: Path, process_id: str, token: str) -> int:
     cwd = Path(process["worktree"])
     store.transition_mission(mission["id"], "implementing", {"dispatched"})
     checkpoint(store, process_id, token, "running", phase="started", current="preparing work order")
-    work_order = {
-        "schema_version": 1,
-        "mission_id": mission["id"],
-        "process_id": process_id,
-        "objective": mission["objective"],
-        "constraints": [
-            "Work only in the assigned git worktree.",
-            "Do not spawn or delegate to other agents.",
-            "Do not expose credentials, local state, or unrelated source content.",
-            "Do not commit or push; aOS retains delivery authority.",
-        ],
-        "verification_command": mission["verify_command"],
-        "output_contract": "Implement the objective, verify it, and summarize files changed and remaining risks.",
-    }
+    work_order = store.work_order(process_id)["content"]
     prompt = "You are an aOS worker. Follow this versioned work order exactly:\n" + json.dumps(
         work_order, indent=2
     )
@@ -112,18 +203,7 @@ def run(home: Path, process_id: str, token: str) -> int:
                 phase="implementing",
                 current=f"executing {process['backend']} worker",
             )
-            child = subprocess.run(
-                command,
-                input=prompt,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                cwd=cwd,
-                timeout=3600,
-            )
-            print(child.stdout, end="", flush=True)
-            if child.returncode != 0:
-                raise StoreError(f"{process['backend']} worker exited with {child.returncode}")
+            stream_cli_driver(store, process, process_id, token, command, prompt, cwd)
         else:
             checkpoint(
                 store,
@@ -133,6 +213,9 @@ def run(home: Path, process_id: str, token: str) -> int:
                 phase="implementing",
                 current="deterministic fake driver completed",
             )
+            store.observe_provider(
+                "fake", "healthy", "built_in", "authoritative", {"model": process["model"]}
+            )
         store.transition_mission(mission["id"], "verifying", {"implementing"})
         checkpoint(
             store, process_id, token, "running", phase="verifying", current="running verifier"
@@ -140,9 +223,10 @@ def run(home: Path, process_id: str, token: str) -> int:
         passed, evidence = run_verification(mission["verify_command"], cwd)
         if not passed:
             checkpoint(store, process_id, token, "failed", phase="verifying", verification=evidence)
-            store.transition_mission(mission["id"], "failed", {"verifying"})
+            fail_attempt_and_mission(store, mission["id"], process["attempt"])
             return 1
         checkpoint(store, process_id, token, "completed", phase="completed", verification=evidence)
+        store.update_attempt_state(mission["id"], process["attempt"], "completed")
         store.transition_mission(mission["id"], "awaiting_approval", {"verifying"})
         store.event(
             "claim.completed",
@@ -154,10 +238,18 @@ def run(home: Path, process_id: str, token: str) -> int:
         return 0
     except Exception as exc:
         try:
+            if process["backend"] != "fake":
+                latest = store.latest_provider_status(process["backend"])
+                if not latest or latest["source"] != "runtime_error":
+                    store.observe_provider(
+                        process["backend"],
+                        "degraded",
+                        "worker_exception",
+                        "estimated",
+                        {"model": process["model"]},
+                    )
             checkpoint(store, process_id, token, "failed", phase="failed", blocker=str(exc))
-            current = store.mission(mission["id"])["state"]
-            if current in {"dispatched", "implementing", "verifying"}:
-                store.transition_mission(mission["id"], "failed", {current})
+            fail_attempt_and_mission(store, mission["id"], process["attempt"])
         except Exception:
             pass
         print(json.dumps({"type": "error", "message": str(exc)}), flush=True)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -15,8 +17,11 @@ from .control import (
     approve_mission,
     authorize_mission,
     create_mission,
+    discover_provider,
     dispatch_mission,
     process_expired_workers,
+    retry_mission,
+    signal_process,
 )
 from .store import AuthorizationError, Store, StoreError, TransitionError
 
@@ -108,12 +113,19 @@ def watch_once(store: Store) -> str:
     if not store.db_path.exists():
         return "aOS daemon=offline missions=0 state=not_initialized\nNo missions. Run `aos init`."
     missions = store.missions()
-    processes = {p["mission_id"]: p for p in store.processes()}
+    processes: dict[str, dict[str, Any]] = {}
+    for process in store.processes():
+        processes.setdefault(process["mission_id"], process)
     active = [m for m in missions if m["state"] not in {"delivered", "cancelled"}]
     blocked = sum(m["state"] in {"failed", "non_convergent"} for m in active)
     approvals = sum(m["state"] == "awaiting_approval" for m in active)
+    provider_summary = (
+        ",".join(f"{item['backend']}:{item['status']}" for item in store.provider_status())
+        or "none"
+    )
     lines = [
-        f"aOS daemon={daemon_status(store)} active={len(active)} blocked={blocked} awaiting_approval={approvals}"
+        f"aOS daemon={daemon_status(store)} active={len(active)} blocked={blocked} "
+        f"awaiting_approval={approvals} providers={provider_summary}"
     ]
     if not active:
         lines.append("No active missions.")
@@ -122,9 +134,15 @@ def watch_once(store: Store) -> str:
         if process:
             cp = process["checkpoint"]
             detail = cp.get("current") or cp.get("blocker") or cp.get("phase") or "starting"
+            sessions = store.worker_sessions(process["id"])
+            session = sessions[-1] if sessions else None
+            session_label = session["id"] if session else "none"
+            if session and session["backend_handle"]:
+                session_label += f"/{session['backend_handle']}"
             lines.append(
                 f"{mission['id']} {mission['state']} {process['backend']}/{process['model']} "
-                f"process={process['id']} detail={json.dumps(detail)}"
+                f"process={process['id']} session={session_label} detail={json.dumps(detail)} "
+                f"route={json.dumps(process['routing_reason'])}"
             )
         else:
             lines.append(f"{mission['id']} {mission['state']} process=none")
@@ -150,6 +168,17 @@ def run_watch(store: Store, once: bool, interval: float) -> None:
 
 def doctor(store: Store) -> tuple[dict[str, Any], bool]:
     root = Path.cwd()
+    cursor_binary = shutil.which("cursor-agent")
+    codex_binary = shutil.which("codex")
+
+    def authenticated(command: list[str]) -> bool:
+        try:
+            return subprocess.run(command, capture_output=True, timeout=15).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    cursor_authenticated = bool(cursor_binary) and authenticated([cursor_binary, "status"])
+    codex_authenticated = bool(codex_binary) and authenticated([codex_binary, "login", "status"])
     checks = [
         {
             "name": "python",
@@ -183,20 +212,28 @@ def doctor(store: Store) -> tuple[dict[str, Any], bool]:
         },
         {
             "name": "cursor_agent",
-            "status": "ok" if shutil.which("cursor-agent") else "warn",
+            "status": "ok" if cursor_binary else "warn",
             "detail": "optional provider",
         },
         {
             "name": "codex",
-            "status": "ok" if shutil.which("codex") else "warn",
+            "status": "ok" if codex_binary else "warn",
             "detail": "optional provider",
         },
         {
-            "name": "CURSOR_API_KEY",
-            "status": "ok" if os.getenv("CURSOR_API_KEY") else "warn",
-            "detail": "set"
-            if os.getenv("CURSOR_API_KEY")
-            else "not set; Cursor CLI login may still work",
+            "name": "cursor_auth",
+            "status": "ok" if cursor_authenticated else "warn",
+            "detail": "authenticated" if cursor_authenticated else "not authenticated",
+        },
+        {
+            "name": "codex_auth",
+            "status": "ok" if codex_authenticated else "warn",
+            "detail": "authenticated" if codex_authenticated else "not authenticated",
+        },
+        {
+            "name": "cursor_sdk",
+            "status": "ok" if importlib.util.find_spec("cursor_sdk") else "warn",
+            "detail": "optional API-key transport",
         },
     ]
     healthy = all(item["status"] != "fail" for item in checks)
@@ -229,7 +266,7 @@ def build_parser() -> argparse.ArgumentParser:
     release.add_argument("--token")
     sync = liaison_sub.add_parser("sync")
     sync.add_argument("--token")
-    sync.add_argument("--since", type=int, default=0)
+    sync.add_argument("--since", type=int)
 
     mission = sub.add_parser("mission", help="create and govern mission contracts")
     mission_sub = mission.add_subparsers(dest="mission_command", required=True)
@@ -252,10 +289,41 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch.add_argument("--token")
     dispatch.add_argument("--backend", choices=["fake", "cursor", "codex"])
     dispatch.add_argument("--model")
+    retry = sub.add_parser("retry", help="retry at the Session, Process, or Attempt level")
+    retry.add_argument("mission_id")
+    retry.add_argument("--token")
+    retry.add_argument("--level", required=True, choices=["session", "process", "attempt"])
+    retry.add_argument("--backend", choices=["fake", "cursor", "codex"])
+    retry.add_argument("--model")
+    process_signal = sub.add_parser("signal", help="pause, resume, or cancel a governed process")
+    process_signal.add_argument("process_id")
+    process_signal.add_argument("action", choices=["pause", "resume", "cancel"])
+    process_signal.add_argument("--token")
     approve = sub.add_parser("approve", help="approve verified work for delivery")
     approve.add_argument("mission_id")
     approve.add_argument("--token")
     sub.add_parser("recover", help="mark expired running processes orphaned")
+    provider = sub.add_parser("provider", help="inspect or record provider health observations")
+    provider_sub = provider.add_subparsers(dest="provider_command", required=True)
+    provider_status = provider_sub.add_parser("status")
+    provider_status.add_argument("--backend", choices=["fake", "cursor", "codex"])
+    provider_discover = provider_sub.add_parser("discover")
+    provider_discover.add_argument("--backend", choices=["fake", "cursor", "codex"])
+    provider_discover.add_argument("--record", action="store_true")
+    provider_discover.add_argument("--token")
+    provider_observe = provider_sub.add_parser("observe")
+    provider_observe.add_argument("--token")
+    provider_observe.add_argument("--backend", required=True, choices=["fake", "cursor", "codex"])
+    provider_observe.add_argument(
+        "--status",
+        required=True,
+        choices=["healthy", "degraded", "limited", "unhealthy", "unknown"],
+    )
+    provider_observe.add_argument("--source", default="liaison")
+    provider_observe.add_argument(
+        "--confidence", default="estimated", choices=["authoritative", "estimated", "unknown"]
+    )
+    provider_observe.add_argument("--note")
     return parser
 
 
@@ -285,8 +353,26 @@ def execute(args: argparse.Namespace, store: Store) -> int:
         )
     elif args.command == "briefing":
         missions = [m for m in store.missions() if m["state"] not in {"delivered", "cancelled"}]
+        active_ids = {mission["id"] for mission in missions}
+        processes = [
+            process for process in store.processes() if process["mission_id"] in active_ids
+        ]
         render(
-            {"missions_count": len(missions), "missions": missions, "processes": store.processes()},
+            {
+                "missions_count": len(missions),
+                "missions": missions,
+                "attempts": [
+                    attempt for mission in missions for attempt in store.attempts(mission["id"])
+                ],
+                "processes": processes,
+                "worker_sessions": [
+                    session
+                    for process in processes
+                    for session in store.worker_sessions(process["id"])
+                ],
+                "providers": store.provider_status(),
+                "attention": store.events_since(0, significant_only=True)[-50:],
+            },
             ["Use `aos mission view <id>` to inspect one mission."],
         )
     elif args.command == "liaison":
@@ -308,15 +394,15 @@ def execute(args: argparse.Namespace, store: Store) -> int:
             store.release_liaison(token_arg(args))
             render({"status": "released"}, ["Another harness may now claim the liaison lease."])
         else:
-            store.require_liaison(token_arg(args))
-            events = store.events_since(args.since, significant_only=True)
+            lease = store.require_liaison(token_arg(args))
+            events, cursor = store.sync_significant(lease["holder"], args.since)
             render(
                 {
                     "count": len(events),
-                    "cursor": events[-1]["id"] if events else args.since,
+                    "cursor": cursor,
                     "events": events,
                 },
-                ["Persist the returned cursor in liaison context and pass it to the next sync."],
+                ["The durable consumer cursor advances through routine and significant events."],
             )
     elif args.command == "mission":
         if args.mission_command == "create":
@@ -342,8 +428,19 @@ def execute(args: argparse.Namespace, store: Store) -> int:
             )
         else:
             mission = store.mission(args.mission_id)
+            processes = store.processes(args.mission_id)
             render(
-                {"mission": mission, "processes": store.processes(args.mission_id)},
+                {
+                    "mission": mission,
+                    "contract": store.contract(args.mission_id),
+                    "attempts": store.attempts(args.mission_id),
+                    "processes": processes,
+                    "worker_sessions": [
+                        session
+                        for process in processes
+                        for session in store.worker_sessions(process["id"])
+                    ],
+                },
                 ["Inspect artifact paths locally; they may contain sensitive source context."],
             )
     elif args.command == "dispatch":
@@ -355,6 +452,22 @@ def execute(args: argparse.Namespace, store: Store) -> int:
                 f"Use `aos mission view {args.mission_id}` for evidence.",
             ],
         )
+    elif args.command == "retry":
+        result = retry_mission(
+            store,
+            token_arg(args),
+            args.mission_id,
+            args.level,
+            args.backend,
+            args.model,
+        )
+        render(
+            {"retry_level": args.level, **result},
+            ["Use `aos watch` to follow the new execution scope."],
+        )
+    elif args.command == "signal":
+        result = signal_process(store, token_arg(args), args.process_id, args.action)
+        render(result, ["Use `aos watch` to confirm the governed process state."])
     elif args.command == "approve":
         approve_mission(store, token_arg(args), args.mission_id)
         render(
@@ -367,6 +480,53 @@ def execute(args: argparse.Namespace, store: Store) -> int:
             {"orphaned_count": count},
             ["Inspect orphaned work with `aos briefing` before retrying."],
         )
+    elif args.command == "provider":
+        if args.provider_command == "status":
+            statuses = store.provider_status(args.backend)
+            render(
+                {"count": len(statuses), "providers": statuses},
+                ["No observation means availability is unknown, not healthy."],
+            )
+        elif args.provider_command == "discover":
+            backends = [args.backend] if args.backend else ["fake", "cursor", "codex"]
+            capabilities = [discover_provider(backend) for backend in backends]
+            if args.record:
+                store.require_liaison(token_arg(args))
+                for capability in capabilities:
+                    status = (
+                        "healthy"
+                        if capability["available"] and capability["authenticated"]
+                        else "unhealthy"
+                    )
+                    store.observe_provider(
+                        capability["backend"],
+                        status,
+                        capability["catalog_source"],
+                        "authoritative",
+                        {"models": capability["models"]},
+                    )
+            render(
+                {"count": len(capabilities), "providers": capabilities, "recorded": args.record},
+                ["Use `--record` with liaison authority to make the catalog available to routing."],
+            )
+        else:
+            store.require_liaison(token_arg(args))
+            observation_id = store.observe_provider(
+                args.backend,
+                args.status,
+                args.source,
+                args.confidence,
+                {"note": args.note} if args.note else {},
+            )
+            render(
+                {
+                    "observation_id": observation_id,
+                    "backend": args.backend,
+                    "status": args.status,
+                    "confidence": args.confidence,
+                },
+                ["Routing uses the latest observation and journals fallback reasons."],
+            )
     return 0
 
 
