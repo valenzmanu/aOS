@@ -2,11 +2,15 @@
 status: accepted
 date: 2026-07-22
 decision_owners: aOS maintainers
-supersedes-direction-of: docs/aos-poc-plan.md (substrate only; goals retained)
+supersedes-direction-of: historical 0.1 plan at e920ff2:docs/aos-poc-plan.md
 related: ADR 0001 (unmerged analysis; kept as analysis, not roadmap)
 ---
 
 # Sparse Constitutional Agent OS (SCAOS)
+
+> **Implementation status:** the repository-source cutover is complete. The superseded `aos/`
+> runtime and its orchestration entrypoints have been removed. Historical source remains available
+> in Git; archived schema fixtures remain only as inputs to the v2 migration tests.
 
 aOS 2.0 is rebuilt on a different substrate. The 0.1 implementation was a correct prototype of
 the wrong architecture: it embodied the OS as a Python control plane (`aos/*.py`) that agents call

@@ -3,6 +3,16 @@
 All notable changes to aOS are documented here. The project follows semantic versioning after the
 initial alpha series.
 
+## 0.2.0 — 2026-07-23
+
+- adopted the sparse constitutional agent-OS architecture
+- made agents the reasoning runtime and the State Tree their interface
+- added the schema-4 journal, closed protocol vocabulary, and scoped liaison authority
+- added deterministic legacy migration and provenance fixtures
+- added the permanent fresh-agent `E2E-00` tracer and read-only governance grader
+- removed the superseded Python control plane, daemon, worker adapters, dashboard, demo, and
+  orchestration entrypoints
+
 ## 0.1.0 — 2026-07-21
 
 Initial public alpha:

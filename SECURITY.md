@@ -1,8 +1,8 @@
 # Security policy
 
-aOS is an early cooperative-assurance proof of concept. It reduces accidental authority and state
-loss; it is **not** a security sandbox and cannot prevent a compromised or deliberately
-non-compliant harness from bypassing project instructions.
+aOS is an early cooperative-assurance system. It reduces accidental authority and state loss; it
+is **not** a security sandbox and cannot prevent a compromised or deliberately non-compliant
+agent harness from bypassing project instructions.
 
 ## Supported versions
 
@@ -20,10 +20,10 @@ all real tokens and private repository content from examples.
 
 ## Sensitive local data
 
-`state/` and `projects/` are ignored because they may contain:
+`state/`, `missions/`, and `projects/` are ignored because they may contain:
 
-- liaison/process credentials in active use (the database stores hashes, but process environments
-  temporarily hold scoped tokens)
+- liaison or worker capabilities in active use (the database stores hashes, but process
+  environments temporarily hold scoped values)
 - objectives, Work Orders, checkpoints, model output, transcripts, and source excerpts
 - external repository worktrees and uncommitted code
 - local usernames, absolute paths, process IDs, and provider session identifiers
@@ -34,8 +34,8 @@ driver and synthetic data. Run `uv run python scripts/check_public_tree.py` befo
 ## Threat-model limits
 
 - Liaison and process tokens are bearer credentials. Protect the environment of active processes.
-- The project rules preventing native subagents are cooperative instructions, not hard enforcement.
-- Provider CLIs/SDKs send approved Work Orders and relevant repository content to their services
-  under those providers' terms and account settings.
-- Verification commands are executed directly without a shell, but they still run local code.
-- Worktrees isolate Git working copies; they do not provide OS, network, or tenant isolation.
+- Distro instructions and agent-role boundaries are cooperative, not hard enforcement.
+- Agent harnesses may send objectives, work orders, and repository content to their configured
+  model providers under those providers' terms and account settings.
+- Verifiers and worker commands execute local code and must be treated as trusted inputs.
+- File-tree and worktree separation do not provide OS, network, or tenant isolation.
