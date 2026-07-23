@@ -12,6 +12,8 @@ FORBIDDEN_PATH_PARTS = {
     "projects",
     "missions",
     ".harbor",
+    ".aos-quarantine",
+    ".aos-backups",
     ".runs",
     "jobs",
     ".venv",

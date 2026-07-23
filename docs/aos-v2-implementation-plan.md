@@ -1,6 +1,6 @@
 ---
 title: aOS 2.0 implementation plan — SCAOS substrate
-status: approved direction; tightened implementation plan; implementation not started
+status: implementation in progress; M0 complete; M1 active
 decision: docs/adr/0002-sparse-constitutional-agent-os.md
 predecessor: docs/aos-poc-plan.md (0.1; goals retained, substrate replaced)
 harbor_baseline: 0.20.0; task schema 1.3
@@ -491,8 +491,8 @@ commands from outside the checkout and confirms that the clone's protocols and s
 
 ### M0 — Decision artifacts and implementation-mode guardrails
 
-Content is complete but M0 is not done until the current uncommitted design and disarmament changes
-are committed together.
+Completed in commit `eb9c6a4`: the design and disarmament changes were committed together after
+the legacy watcher was stopped and the repository-development instructions were verified.
 
 - Commit ADR 0002, this plan, implementation-mode `AGENTS.md`, disarmed editor surfaces, and
   runtime/eval ignore rules. The public-tree scan treats `missions/` as private even if a future

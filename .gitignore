@@ -24,6 +24,8 @@ missions/
 .harbor/
 evals/.runs/
 /jobs/
+.aos-quarantine/
+.aos-backups/
 
 # Local agent/editor state
 .cursor/worktrees/

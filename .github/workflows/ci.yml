@@ -14,11 +14,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
       - run: uv sync --extra dev --locked
+      - run: uv run python tests/legacy/fixtures/generate.py --check
       - run: uv run ruff check .
       - run: uv run pytest
       - run: uv run python scripts/check_public_tree.py

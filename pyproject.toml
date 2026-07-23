@@ -34,7 +34,7 @@ Homepage = "https://github.com/valenzmanu/aOS"
 Issues = "https://github.com/valenzmanu/aOS/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["aos"]
+packages = ["aos", "modules"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
