@@ -1,7 +1,9 @@
 ---
-description: Open the persistent aOS flight board in this agent session
+description: Suspended — aOS 0.1 watch terminal (do not start during the v2 rebuild)
 ---
 
-Run `uv run aos watch` in a dedicated long-running terminal. Leave it running, do not await or
-terminate it, and reuse an existing aOS watch terminal rather than starting a duplicate. Tell the
-human that the terminal can be focused, tiled, or expanded beside the Agents Window conversation.
+This command is suspended while aOS is rebuilt on the v2 substrate (see
+`docs/adr/0002-sparse-constitutional-agent-os.md` and `docs/aos-v2-implementation-plan.md`).
+
+Do not start `uv run aos watch` or any 0.1 liaison surface. Tell the human the 0.1 flight board is
+disarmed during implementation and will return as a distro skill at milestone M3.

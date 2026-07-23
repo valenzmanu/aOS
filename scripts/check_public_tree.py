@@ -7,7 +7,16 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-FORBIDDEN_PATH_PARTS = {"state", "projects", ".venv", "__pycache__"}
+FORBIDDEN_PATH_PARTS = {
+    "state",
+    "projects",
+    "missions",
+    ".harbor",
+    ".runs",
+    "jobs",
+    ".venv",
+    "__pycache__",
+}
 PATTERNS = {
     "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     "GitHub token": re.compile(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{20,}\b"),

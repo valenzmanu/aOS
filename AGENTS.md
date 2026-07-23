@@ -1,31 +1,40 @@
-# aOS liaison protocol
+# aOS — implementation mode (0.1 liaison protocol suspended)
 
-This repository uses aOS as its agent control plane. A harness session may act as the liaison only
-while it holds the singleton lease.
+> **The 0.1 liaison protocol that previously lived in this file is suspended.** Do NOT claim a
+> liaison lease, do NOT start `uv run aos watch`, do NOT run `aos liaison sync`, and do NOT
+> dispatch missions through the 0.1 CLI. The Python control plane under `aos/` is legacy code
+> being ported, not the operating system of this repository.
 
-## Start of every liaison session
+## Why
 
-1. Run `uv run aos init` if state is not initialized.
-2. Run `uv run aos liaison claim --harness <harness-name>`.
-3. Keep the returned token only in `AOS_LIAISON_TOKEN`; never write it to a file, chat, commit,
-   command argument, log, rule, or Work Order.
-4. Start one long-running `uv run aos watch` terminal. Reuse it rather than opening duplicates.
-5. Run `uv run aos liaison sync --since <cursor>` before each user-facing turn.
+aOS is being rebuilt on a new substrate (agents navigating a file tree, with determinism only at
+constitutional joints). The decision and rationale are in
+`docs/adr/0002-sparse-constitutional-agent-os.md`; the build order is in
+`docs/aos-v2-implementation-plan.md`. Read both before changing anything.
 
-## Delegation boundary
+The 0.1 protocol told every agent session to become a liaison and operate the old OS. During the
+rebuild that behavior would interfere with implementation work, so it is disarmed here and in
+`.cursor/rules/aos-liaison.mdc`, `.cursor/commands/aos-watch.md`, and `.vscode/tasks.json`. A new
+dual-mode distro entry replaces this file at milestone M3 of the plan: repository-development
+requests remain in implementor mode, while liaison mode requires explicit activation for a named
+state root. Merely finding state files will never activate liaison mode.
 
-- All mission work starts with `aos mission create`, explicit authorization, then `aos dispatch`.
-- Do not use harness-native subagents, Cursor multitask, Codex collaboration tools, or undeclared
-  background agents for mission work. This is a cooperative PoC guardrail, not a sandbox boundary.
-- Workers may edit only their assigned worktree and may not authorize, approve, deliver, merge,
-  push, spawn another agent, or control another mission.
-- The liaison must not report completion until aOS records verifier evidence and the mission is
-  `awaiting_approval`. Only the human can authorize and approve.
+## Working in this repository now
 
-## Privacy
+- You are an implementor, not a liaison. Work directly with normal tools: edit, test, commit.
+- Treat `aos/` (0.1 Python) as characterization material. Preserve its proven lease atomicity,
+  token hashing, event ordering, durable identities/hashes, retry identities, worktree isolation,
+  and verifier-failure blocking; replace its caller-supplied FSM edges and evidence-free approval
+  as specified in the plan. Do not extend 0.1 surfaces.
+- Keep 0.1 runnable but frozen through M5's pre-cutover reconstruction gate. Delete its old
+  entrypoints and orchestration surfaces only in the M5 cutover change, then rerun the full suite.
+- Tests: `uv run pytest`. Lint: `uv run ruff check .`.
+
+## Privacy (still in force — substrate-independent)
 
 - Never include secrets, credentials, unrelated local paths, private repository contents, raw
   conversation history, or state artifacts in commits or public issues.
-- `state/` can contain prompts, transcripts, source excerpts, and process metadata. Keep it local.
-- Promote only the objective and explicitly approved constraints into a Work Order.
+- `state/`, `projects/`, and (once created) `missions/` can contain prompts, transcripts, source
+  excerpts, and process metadata. Keep them local; they are gitignored.
+- Never write bearer tokens to files, chat, commits, command arguments, logs, or rules.
 - Before publishing, run `uv run python scripts/check_public_tree.py` and inspect staged changes.
