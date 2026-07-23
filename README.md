@@ -1,5 +1,12 @@
 # aOS — Agent OS
 
+> [!IMPORTANT]
+> **aOS 2.0 is under active reconstruction.** The 0.1 Python control plane documented below is
+> frozen compatibility material, not the repository's current development workflow. Do not claim
+> a 0.1 liaison lease, start its watcher, sync it, or dispatch through its CLI while working on the
+> v2 rebuild. Start with [ADR 0002](docs/adr/0002-sparse-constitutional-agent-os.md) and the
+> [implementation plan](docs/aos-v2-implementation-plan.md).
+
 aOS is an experimental, harness-agnostic control plane for supervising coding agents from one
 human-facing liaison. It keeps mission state, authority, routing decisions, checkpoints, and
 verification evidence outside any individual Cursor or Codex conversation.
@@ -50,7 +57,11 @@ the authoritative implementation-status statement; planned features are not pres
 
 No provider credentials are required for the fake-driver demo or test suite.
 
-## Install and run the example
+## Legacy 0.1 example (frozen)
+
+The commands in this section describe the preserved 0.1 release. They remain available for
+characterization and rollback testing through the v2 migration, but are not the workflow for
+developing this repository.
 
 ```bash
 git clone https://github.com/valenzmanu/aOS.git
@@ -63,7 +74,7 @@ The demo creates a temporary Git repository from `examples/calculator`, initiali
 state, claims the liaison lease, dispatches a deterministic worker, runs the example tests, and
 prints the approval-ready flight board. It deletes its temporary runtime data on exit.
 
-## Manual quick start
+## Legacy 0.1 manual quick start
 
 Initialize local state and claim the liaison role:
 
@@ -122,11 +133,11 @@ same allowance as an IDE subscription. The Codex adapter intentionally uses the 
 local CLI because that is the verified subscription-backed surface. Codex Goals are not exposed by
 the public CLI/SDK adapter in this release.
 
-## Cursor Agents Window
+## Legacy 0.1 Cursor Agents Window behavior
 
-The root `AGENTS.md` and always-applied Cursor rule tell the liaison to claim its lease and start one
-long-running `uv run aos watch` terminal. `/aos-watch` is a command fallback. In the traditional
-editor, `.vscode/tasks.json` starts a dedicated non-focused watch terminal when the folder opens.
+The 0.1 release originally told a liaison to claim its lease and start one long-running
+`uv run aos watch` terminal. Those repository and editor instructions are now explicitly disarmed
+during the v2 rebuild; `.vscode/tasks.json` no longer starts the watcher on folder open.
 
 These instructions discourage Cursor multitask and native subagents for governed work, but they
 cannot technically disable every harness capability. Only workers created by `aos dispatch` are

@@ -15,9 +15,17 @@ build/
 # aOS runtime data can contain prompts, source excerpts, and credentials-in-use.
 state/
 projects/
+missions/
 *.db
 *.db-shm
 *.db-wal
+
+# Local eval materialization, Harbor jobs, and verifier results.
+.harbor/
+evals/.runs/
+/jobs/
+.aos-quarantine/
+.aos-backups/
 
 # Local agent/editor state
 .cursor/worktrees/

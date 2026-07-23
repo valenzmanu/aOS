@@ -2,11 +2,11 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "aOS Watch",
+      "label": "aOS Watch (0.1 — suspended during v2 rebuild)",
+      "detail": "Disarmed: no folderOpen auto-run. See docs/adr/0002-sparse-constitutional-agent-os.md. Manual invocation only, for inspecting legacy 0.1 state.",
       "type": "shell",
       "command": "uv run aos watch",
       "isBackground": true,
-      "runOptions": { "runOn": "folderOpen", "instanceLimit": 1 },
       "presentation": {
         "panel": "dedicated",
         "group": "aos",

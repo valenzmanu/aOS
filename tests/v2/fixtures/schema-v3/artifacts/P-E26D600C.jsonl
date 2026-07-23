@@ -1,0 +1,2 @@
+{"thread_id":"fixture-thread-schema-2","type":"thread.started"}
+{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":5}}

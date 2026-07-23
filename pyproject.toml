@@ -28,13 +28,14 @@ dev = ["pytest>=8.3", "ruff>=0.11"]
 [project.scripts]
 aos = "aos.cli:main"
 aosd = "aos.daemon:main"
+aos-v0 = "modules.v0_tracer:main"
 
 [project.urls]
 Homepage = "https://github.com/valenzmanu/aOS"
 Issues = "https://github.com/valenzmanu/aOS/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["aos"]
+packages = ["aos", "modules"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

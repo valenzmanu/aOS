@@ -1,16 +1,15 @@
 ---
-description: aOS liaison lease, oversight, delegation, and privacy boundary
+description: aOS implementation mode — 0.1 liaison protocol suspended; privacy boundary still in force
 alwaysApply: true
 ---
 
-# aOS liaison rules
+# aOS rules (implementation mode)
 
-- Read `AGENTS.md` and follow its liaison startup contract.
-- Claim the singleton liaison lease before privileged aOS commands.
-- After claiming, start exactly one dedicated long-running `uv run aos watch` terminal and tell
-  the human it can be focused or tiled beside this conversation.
-- Synchronize significant durable events before every user-facing response.
-- Start mission workers only through `aos dispatch`. Do not use Cursor multitask or native
-  subagents for governed mission work.
-- Never copy the liaison token into rules, Work Orders, files, logs, or messages.
-- Treat `state/`, `projects/`, worker transcripts, and external repository content as private.
+- The 0.1 liaison protocol is suspended: do NOT claim a liaison lease, start `uv run aos watch`,
+  run `aos liaison sync`, or dispatch missions through the 0.1 CLI. See `AGENTS.md` and
+  `docs/adr/0002-sparse-constitutional-agent-os.md`.
+- Treat `aos/` (0.1 Python) as port-from reference, not a surface to extend or operate.
+- Privacy boundary remains in force: treat `state/`, `projects/`, `missions/`, worker transcripts,
+  and external repository content as private; never write bearer tokens or runtime artifacts into
+  rules, files, logs, commits, or messages.
+- Before any public push: `uv run python scripts/check_public_tree.py`.
