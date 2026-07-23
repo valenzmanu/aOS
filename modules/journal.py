@@ -9,13 +9,20 @@ import shutil
 import sqlite3
 import stat
 import tempfile
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-CURRENT_SCHEMA_VERSION = 3
+from modules.protocol import (
+    EventAggregateType,
+    ProtocolViolation,
+    require_generic_event_kind,
+    require_reserved_event,
+)
+
+CURRENT_SCHEMA_VERSION = 4
 LEGACY_STRUCTURE_FINGERPRINTS = {
     1: "17cc81e41aff3845a83e0da9496ec1eba30be0e849fd2679828fcc438271c541",
     2: "abb082983ec5da9b65a33f107143a131ffdddc6570947dc5e85142b50a8064d2",
@@ -45,9 +52,14 @@ CONTESTED_AGGREGATES = {
 }
 CURRENT_REQUIRED_TABLES = {
     "aggregate_revisions",
+    "approval_decisions",
     "attempts",
+    "authority_epochs",
     "contract_revisions",
+    "event_envelopes",
+    "event_targets",
     "events",
+    "evidence_records",
     "inbox_cursors",
     "leases",
     "legacy_artifacts",
@@ -58,10 +70,37 @@ CURRENT_REQUIRED_TABLES = {
     "migration_cleanup",
     "migration_snapshots",
     "missions",
+    "operation_conflicts",
+    "operation_targets",
+    "operations",
     "processes",
     "provider_observations",
     "work_orders",
     "worker_sessions",
+}
+V2_CORE_TABLES = {
+    "approval_decisions",
+    "authority_epochs",
+    "event_envelopes",
+    "event_targets",
+    "evidence_records",
+    "operation_conflicts",
+    "operation_targets",
+    "operations",
+}
+SCHEMA3_REQUIRED_TABLES = CURRENT_REQUIRED_TABLES - V2_CORE_TABLES
+SCHEMA3_POST_BOUNDARY_EVENT_KINDS = {
+    "attempt.reconciled",
+    "authority.legacy_closed",
+    "migration.boundary",
+    "migration.cleanup_completed",
+    "mission.reconciled",
+    "process.reconciled",
+    "worker_session.reconciled",
+}
+SCHEMA3_STRUCTURE_FINGERPRINTS = {
+    1: "56d1787cd6f5b2ce0b9673072aa498c29947d2ea5665e7bfa576c390a0a91750",
+    2: "9dbb2c3b35f0f43ff1fd50339aceb98b7eced27b90a118c81b23df7ba9b685dd",
 }
 SECRET_ARTIFACT_PATTERNS = (
     (
@@ -90,6 +129,19 @@ SECRET_ARTIFACT_PATTERNS = (
 )
 MIGRATION_OPERATION_PATTERN = re.compile(r"OP-[A-Z0-9][A-Z0-9_-]{1,124}\Z")
 MIGRATION_INVOKER_PATTERN = re.compile(r"maintenance:[A-Za-z0-9][A-Za-z0-9._-]{0,95}\Z")
+OPERATION_ACTION_PATTERN = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+\Z")
+PUBLIC_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}\Z")
+INVOKER_KINDS = {
+    "eval_fixture",
+    "liaison",
+    "liaison_candidate",
+    "maintenance_operator",
+    "migration",
+    "module",
+    "reconciler",
+    "worker",
+}
+AUTHORITY_BEARING_INVOKERS = {"liaison", "worker"}
 SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"""(?ix)
     ["']?([a-z][a-z0-9_.-]{1,63})["']?
@@ -143,6 +195,66 @@ class MigrationRejected(JournalError):
     """The requested migration does not match the observed legacy root."""
 
 
+class InvalidOperation(JournalError):
+    """An operation request is malformed or unsafe to persist."""
+
+
+@dataclass(frozen=True, slots=True)
+class Invoker:
+    kind: str
+    id: str
+    authority_epoch_id: str | None = None
+    on_behalf_of: str | None = None
+    decision_source_hash: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExpectedRevision:
+    aggregate_type: str
+    aggregate_id: str
+    revision: int
+    role: str = "write"
+
+
+@dataclass(frozen=True, slots=True)
+class OperationRequest:
+    operation_id: str
+    action: str
+    invoker: Invoker
+    expected_revisions: tuple[ExpectedRevision, ...]
+    payload: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class GateRejection:
+    code: str
+    details: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class OperationOutcome:
+    status: str
+    operation_id: str
+    admission_event_id: int | None
+    rejection_event_id: int | None
+    domain_event_ids: tuple[int, ...]
+    revisions: tuple[ExpectedRevision, ...]
+    reason: str | None = None
+    original_status: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EventRecord:
+    event_id: int
+    occurred_at: str
+    kind: str
+    severity: str
+    aggregate_type: str
+    aggregate_id: str
+    payload: Mapping[str, object]
+    envelope: Mapping[str, object] | None
+
+
 @dataclass(frozen=True)
 class MigrationRequest:
     operation_id: str
@@ -162,6 +274,33 @@ class MigrationOutcome:
     boundary_event_id: int
     snapshot_digest: str
     backup_digest: str
+
+
+@dataclass(frozen=True)
+class SchemaUpgradeOutcome:
+    status: str
+    operation_id: str
+    source_schema: int
+    target_schema: int
+    legacy_high_water_event_id: int
+    upgrade_event_id: int
+    backup_digest: str
+
+
+@dataclass(frozen=True)
+class InitializationRequest:
+    operation_id: str
+    invoker_id: str
+    expected_schema: int
+    expected_root_state: str
+
+
+@dataclass(frozen=True)
+class InitializationOutcome:
+    status: str
+    operation_id: str
+    schema_version: int
+    initialization_event_id: int
 
 
 @dataclass(frozen=True)
@@ -187,14 +326,48 @@ def utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def canonical_json_bytes(value: object) -> bytes:
+    """Encode deterministic JSON for request and content identities."""
+
+    try:
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise InvalidOperation("value is not canonical JSON") from exc
+    return encoded.encode("utf-8")
+
+
+def content_digest(value: object) -> str:
+    """Return the SHA-256 identity of canonical JSON content."""
+
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
 def _canonical_json(value: object) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    return canonical_json_bytes(value).decode("utf-8")
 
 
 def _request_hash(request: MigrationRequest) -> str:
     encoded = _canonical_json(
         {
             "expected_high_water_event_id": request.expected_high_water_event_id,
+            "expected_root_state": request.expected_root_state,
+            "expected_schema": request.expected_schema,
+            "invoker_id": request.invoker_id,
+            "operation_id": request.operation_id,
+        }
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _initialization_request_hash(request: InitializationRequest) -> str:
+    encoded = _canonical_json(
+        {
             "expected_root_state": request.expected_root_state,
             "expected_schema": request.expected_schema,
             "invoker_id": request.invoker_id,
@@ -522,6 +695,25 @@ def _require_database_path_identity(
         raise MigrationRejected("journal database pathname changed during migration")
 
 
+def _unlink_path_if_identity(
+    path: Path,
+    expected_identity: tuple[int, int],
+) -> bool:
+    """Remove only the regular file identified by a previously held descriptor."""
+
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or (int(metadata.st_dev), int(metadata.st_ino)) != expected_identity
+    ):
+        return False
+    path.unlink()
+    return True
+
+
 def _validate_sqlite_source_files(db_path: Path) -> tuple[int, int]:
     identity = _database_path_identity(db_path)
     for suffix in ("-wal", "-shm"):
@@ -597,7 +789,8 @@ def _checkpoint_and_fsync_database(
         raise JournalError("cannot checkpoint journal with an active transaction")
     if expected_identity is not None:
         _require_database_path_identity(db_path, expected_identity)
-    journal_mode = str(db.execute("PRAGMA journal_mode").fetchone()[0])
+    journal_mode_rows = db.execute("PRAGMA journal_mode").fetchall()
+    journal_mode = str(journal_mode_rows[0][0])
     if journal_mode == "wal":
         checkpoint = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         if checkpoint is None or int(checkpoint[0]) != 0:
@@ -628,6 +821,59 @@ def _checkpoint_and_fsync_database(
     if expected_identity is not None:
         _require_database_path_identity(db_path, expected_identity)
     _fsync_directory(db_path.parent)
+
+
+def _verify_v2_event_closure(db: sqlite3.Connection) -> None:
+    first_envelope = db.execute("SELECT MIN(event_id) FROM event_envelopes").fetchone()
+    if first_envelope is None or first_envelope[0] is None:
+        raise JournalError("current journal has no v2 event envelope boundary")
+    missing_envelopes = db.execute(
+        """
+        SELECT e.id
+        FROM events AS e
+        LEFT JOIN event_envelopes AS envelope ON envelope.event_id=e.id
+        WHERE e.id >= ? AND envelope.event_id IS NULL
+        LIMIT 1
+        """,
+        (int(first_envelope[0]),),
+    ).fetchone()
+    if missing_envelopes is not None:
+        raise JournalError("post-boundary event is missing its v2 envelope")
+    missing_targets = db.execute(
+        """
+        SELECT envelope.event_id
+        FROM event_envelopes AS envelope
+        JOIN events AS e ON e.id=envelope.event_id
+        LEFT JOIN event_targets AS target
+          ON target.event_id=e.id
+         AND target.aggregate_type=e.aggregate_type
+         AND target.aggregate_id=e.aggregate_id
+        WHERE target.event_id IS NULL
+        LIMIT 1
+        """
+    ).fetchone()
+    if missing_targets is not None:
+        raise JournalError("v2 event envelope is missing its immutable aggregate target")
+    required_triggers = {
+        "event_envelopes_no_delete",
+        "event_envelopes_no_update",
+        "event_targets_no_delete",
+        "event_targets_no_update",
+        "events_no_delete",
+        "events_no_update",
+    }
+    observed_triggers = {
+        str(row[0])
+        for row in db.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type='trigger'
+            """
+        ).fetchall()
+    }
+    if not observed_triggers >= required_triggers:
+        raise JournalError("current journal append-only guards are incomplete")
 
 
 def inspect_journal(root: Path) -> JournalInspection:
@@ -661,6 +907,7 @@ def inspect_journal(root: Path) -> JournalInspection:
             raise MigrationRejected(
                 "journal has pending migration cleanup and is not readable as canonical v2 state"
             )
+        _verify_v2_event_closure(db)
         _verify_canonical_cas_closure(db, db_path.parent)
         integrity = str(db.execute("PRAGMA integrity_check").fetchone()[0])
         if integrity != "ok":
@@ -1247,28 +1494,10 @@ def _requires_protected_quarantine(reason: object) -> bool:
     return text.startswith("secret-bearing") or text.startswith("policy-unsafe")
 
 
-def _finish_quarantine_cleanup(
+def _remove_quarantined_artifact_sources(
     root: Path,
     db: sqlite3.Connection,
-    operation_id: str,
-    clock: Callable[[], datetime],
 ) -> None:
-    cleanup = db.execute(
-        """
-        SELECT c.status, c.pending_items
-        FROM migration_cleanup AS c
-        WHERE c.operation_id=?
-        """,
-        (operation_id,),
-    ).fetchone()
-    if cleanup is None:
-        raise JournalError("migration cleanup projection is missing")
-    if cleanup[0] == "completed":
-        return
-    completed_at = clock()
-    if completed_at.tzinfo is None or completed_at.utcoffset() is None:
-        raise MigrationRejected("migration clock must return a timezone-aware datetime")
-    completed_at_text = completed_at.isoformat(timespec="milliseconds")
     rows = db.execute(
         """
         SELECT legacy_path, digest, quarantine_reason
@@ -1304,6 +1533,31 @@ def _finish_quarantine_cleanup(
         source.unlink()
         _fsync_directory(source.parent)
 
+
+def _finish_quarantine_cleanup(
+    root: Path,
+    db: sqlite3.Connection,
+    operation_id: str,
+    clock: Callable[[], datetime],
+) -> None:
+    cleanup = db.execute(
+        """
+        SELECT c.status, c.pending_items
+        FROM migration_cleanup AS c
+        WHERE c.operation_id=?
+        """,
+        (operation_id,),
+    ).fetchone()
+    if cleanup is None:
+        raise JournalError("migration cleanup projection is missing")
+    if cleanup[0] == "completed":
+        return
+    completed_at = clock()
+    if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+        raise MigrationRejected("migration clock must return a timezone-aware datetime")
+    completed_at_text = completed_at.isoformat(timespec="milliseconds")
+    _remove_quarantined_artifact_sources(root, db)
+
     try:
         db.execute("BEGIN IMMEDIATE")
         completed_event_id = _append_migration_event(
@@ -1317,6 +1571,25 @@ def _finish_quarantine_cleanup(
                 "removed_items": int(cleanup[1]),
             },
         )
+        operation = db.execute(
+            """
+            SELECT request_hash, admission_event_id
+            FROM operations
+            WHERE operation_id=?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if operation is None:
+            raise JournalError("migration operation projection is missing")
+        _insert_event_envelope(
+            db,
+            event_id=completed_event_id,
+            invoker_kind="migration",
+            invoker_id=operation_id,
+            operation_id=operation_id,
+            request_hash=str(operation[0]),
+            admission_id=int(operation[1]),
+        )
         cursor = db.execute(
             """
             UPDATE migration_cleanup
@@ -1327,6 +1600,14 @@ def _finish_quarantine_cleanup(
         )
         if cursor.rowcount != 1:
             raise JournalError("migration cleanup status changed concurrently")
+        db.execute(
+            """
+            UPDATE operations
+            SET status='completed', completed_event_id=?, completed_at=?
+            WHERE operation_id=? AND status='admitted'
+            """,
+            (completed_event_id, completed_at_text, operation_id),
+        )
     except Exception:
         db.rollback()
         raise
@@ -1493,6 +1774,98 @@ def _verify_recorded_migration_effects(
                 f"legacy artifact quarantine {legacy_path}",
                 root.parent,
             )
+
+
+def _create_empty_base_tables(db: sqlite3.Connection) -> None:
+    db.execute(
+        """
+        CREATE TABLE metadata (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            occurred_at TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            aggregate_type TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE leases (
+            kind TEXT PRIMARY KEY,
+            holder TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE missions (
+            id TEXT PRIMARY KEY,
+            project TEXT NOT NULL,
+            objective TEXT NOT NULL,
+            state TEXT NOT NULL,
+            allowed_backends TEXT NOT NULL,
+            allowed_models TEXT NOT NULL,
+            allow_anthropic INTEGER NOT NULL DEFAULT 0,
+            verify_command TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE processes (
+            id TEXT PRIMARY KEY,
+            mission_id TEXT NOT NULL REFERENCES missions(id),
+            attempt INTEGER NOT NULL,
+            backend TEXT NOT NULL,
+            model TEXT NOT NULL,
+            state TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            token_expires_at TEXT NOT NULL,
+            worktree TEXT,
+            session_id TEXT,
+            pid INTEGER,
+            checkpoint TEXT NOT NULL DEFAULT '{}',
+            routing_reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE inbox_cursors (
+            consumer TEXT PRIMARY KEY,
+            event_id INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE INDEX events_aggregate
+        ON events(aggregate_type, aggregate_id, id)
+        """
+    )
+    db.execute(
+        """
+        CREATE INDEX processes_mission
+        ON processes(mission_id, attempt)
+        """
+    )
 
 
 def _create_durable_projection_tables(db: sqlite3.Connection) -> None:
@@ -1868,9 +2241,15 @@ def _create_migration_tables(db: sqlite3.Connection) -> None:
             aggregate_type TEXT NOT NULL,
             aggregate_id TEXT NOT NULL,
             revision INTEGER NOT NULL,
-            snapshot_digest TEXT NOT NULL REFERENCES migration_snapshots(digest),
+            snapshot_digest TEXT REFERENCES migration_snapshots(digest),
+            genesis_event_id INTEGER REFERENCES events(id),
             source_event_id INTEGER NOT NULL REFERENCES events(id),
-            PRIMARY KEY (aggregate_type, aggregate_id)
+            PRIMARY KEY (aggregate_type, aggregate_id),
+            CHECK (
+                (snapshot_digest IS NOT NULL AND genesis_event_id IS NULL)
+                OR
+                (snapshot_digest IS NULL AND genesis_event_id IS NOT NULL)
+            )
         )
         """
     )
@@ -1888,6 +2267,231 @@ def _create_migration_tables(db: sqlite3.Connection) -> None:
             source_event_id INTEGER NOT NULL REFERENCES events(id),
             UNIQUE(kind, subject_id)
         )
+        """
+    )
+    _create_v2_core_tables(db)
+
+
+def _create_v2_core_tables(db: sqlite3.Connection) -> None:
+    db.execute(
+        """
+        CREATE TABLE authority_epochs (
+            epoch_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK(
+                kind IN ('liaison', 'worker')
+            ),
+            subject_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(
+                status IN ('active', 'released', 'revoked', 'expired', 'closed')
+            ),
+            issued_event_id INTEGER NOT NULL REFERENCES events(id),
+            closed_at TEXT,
+            closed_event_id INTEGER REFERENCES events(id),
+            close_reason TEXT,
+            CHECK (
+                (
+                    status='active'
+                    AND closed_at IS NULL
+                    AND closed_event_id IS NULL
+                    AND close_reason IS NULL
+                )
+                OR (
+                    status!='active'
+                    AND closed_at IS NOT NULL
+                    AND closed_event_id IS NOT NULL
+                    AND close_reason IS NOT NULL
+                )
+            )
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE UNIQUE INDEX authority_epochs_one_active_liaison
+        ON authority_epochs(kind)
+        WHERE kind='liaison' AND status='active'
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE operations (
+            operation_id TEXT PRIMARY KEY,
+            action TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            invoker_kind TEXT NOT NULL,
+            invoker_id TEXT NOT NULL,
+            authority_epoch_id TEXT REFERENCES authority_epochs(epoch_id),
+            status TEXT NOT NULL CHECK(
+                status IN ('admitted', 'rejected', 'completed', 'failed')
+            ),
+            admission_event_id INTEGER REFERENCES events(id),
+            rejection_event_id INTEGER REFERENCES events(id),
+            completed_event_id INTEGER REFERENCES events(id),
+            outcome TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            CHECK (
+                (status='rejected' AND rejection_event_id IS NOT NULL)
+                OR (status!='rejected' AND rejection_event_id IS NULL)
+            )
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE operation_targets (
+            operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+            aggregate_type TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('read', 'write')),
+            expected_revision INTEGER NOT NULL CHECK(expected_revision >= 0),
+            observed_revision INTEGER NOT NULL CHECK(observed_revision >= 0),
+            PRIMARY KEY (operation_id, aggregate_type, aggregate_id)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE operation_conflicts (
+            operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+            conflicting_request_hash TEXT NOT NULL,
+            rejection_event_id INTEGER NOT NULL UNIQUE REFERENCES events(id),
+            observed_at TEXT NOT NULL,
+            PRIMARY KEY (operation_id, conflicting_request_hash)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE event_envelopes (
+            event_id INTEGER PRIMARY KEY REFERENCES events(id),
+            envelope_version INTEGER NOT NULL CHECK(envelope_version = 1),
+            payload_schema_version INTEGER NOT NULL CHECK(payload_schema_version >= 1),
+            invoker_kind TEXT NOT NULL,
+            invoker_id TEXT NOT NULL,
+            authority_epoch_id TEXT REFERENCES authority_epochs(epoch_id),
+            evaluated_expires_at TEXT,
+            on_behalf_of TEXT,
+            decision_source_hash TEXT,
+            operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+            request_key TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            causation_id TEXT,
+            admission_id INTEGER REFERENCES events(id),
+            CHECK (
+                (on_behalf_of IS NULL AND decision_source_hash IS NULL)
+                OR
+                (on_behalf_of IS NOT NULL AND decision_source_hash IS NOT NULL)
+            )
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE event_targets (
+            event_id INTEGER NOT NULL REFERENCES event_envelopes(event_id),
+            aggregate_type TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('operation', 'target')),
+            PRIMARY KEY (event_id, aggregate_type, aggregate_id)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE evidence_records (
+            digest TEXT PRIMARY KEY,
+            record_schema_version INTEGER NOT NULL CHECK(record_schema_version = 1),
+            mission_id TEXT NOT NULL,
+            mission_revision INTEGER NOT NULL CHECK(mission_revision >= 1),
+            contract_revision_id TEXT NOT NULL,
+            contract_hash TEXT NOT NULL,
+            attempt_id TEXT NOT NULL,
+            process_id TEXT NOT NULL,
+            worker_session_id TEXT NOT NULL,
+            git_head TEXT NOT NULL,
+            index_digest TEXT NOT NULL,
+            worktree_manifest_digest TEXT NOT NULL,
+            verifier_spec_digest TEXT NOT NULL,
+            command_hash TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT NOT NULL,
+            exit_status INTEGER NOT NULL,
+            output_artifacts TEXT NOT NULL,
+            source_event_id INTEGER NOT NULL UNIQUE REFERENCES events(id)
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TABLE approval_decisions (
+            decision_event_id INTEGER PRIMARY KEY REFERENCES events(id),
+            decision_schema_version INTEGER NOT NULL CHECK(decision_schema_version = 1),
+            mission_id TEXT NOT NULL,
+            expected_mission_revision INTEGER NOT NULL CHECK(expected_mission_revision >= 1),
+            evidence_digest TEXT NOT NULL REFERENCES evidence_records(digest),
+            decision TEXT NOT NULL CHECK(decision IN ('approved', 'rejected')),
+            human_principal TEXT NOT NULL,
+            decision_source_hash TEXT NOT NULL
+        )
+        """
+    )
+    db.execute(
+        """
+        CREATE TRIGGER events_no_update
+        BEFORE UPDATE ON events
+        BEGIN
+            SELECT RAISE(ABORT, 'events are append-only');
+        END
+        """
+    )
+    db.execute(
+        """
+        CREATE TRIGGER events_no_delete
+        BEFORE DELETE ON events
+        BEGIN
+            SELECT RAISE(ABORT, 'events are append-only');
+        END
+        """
+    )
+    db.execute(
+        """
+        CREATE TRIGGER event_envelopes_no_update
+        BEFORE UPDATE ON event_envelopes
+        BEGIN
+            SELECT RAISE(ABORT, 'event envelopes are immutable');
+        END
+        """
+    )
+    db.execute(
+        """
+        CREATE TRIGGER event_envelopes_no_delete
+        BEFORE DELETE ON event_envelopes
+        BEGIN
+            SELECT RAISE(ABORT, 'event envelopes are immutable');
+        END
+        """
+    )
+    db.execute(
+        """
+        CREATE TRIGGER event_targets_no_update
+        BEFORE UPDATE ON event_targets
+        BEGIN
+            SELECT RAISE(ABORT, 'event targets are immutable');
+        END
+        """
+    )
+    db.execute(
+        """
+        CREATE TRIGGER event_targets_no_delete
+        BEFORE DELETE ON event_targets
+        BEGIN
+            SELECT RAISE(ABORT, 'event targets are immutable');
+        END
         """
     )
 
@@ -1915,6 +2519,172 @@ def _append_migration_event(
         ),
     )
     return int(cursor.lastrowid)
+
+
+def _insert_event_envelope(
+    db: sqlite3.Connection,
+    *,
+    event_id: int,
+    invoker_kind: str,
+    invoker_id: str,
+    operation_id: str,
+    request_hash: str,
+    admission_id: int | None,
+    authority_epoch_id: str | None = None,
+    evaluated_expires_at: str | None = None,
+    on_behalf_of: str | None = None,
+    decision_source_hash: str | None = None,
+    payload_schema_version: int = 1,
+) -> None:
+    if not _valid_sha256(request_hash):
+        raise JournalError("event envelope request hash is not canonical SHA-256")
+    event = db.execute(
+        """
+        SELECT aggregate_type, aggregate_id
+        FROM events
+        WHERE id=?
+        """,
+        (event_id,),
+    ).fetchone()
+    if event is None:
+        raise JournalError("cannot envelope a missing event")
+    db.execute(
+        """
+        INSERT INTO event_envelopes(
+            event_id, envelope_version, payload_schema_version,
+            invoker_kind, invoker_id, authority_epoch_id,
+            evaluated_expires_at, on_behalf_of, decision_source_hash,
+            operation_id, request_key, request_hash, causation_id, admission_id
+        ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event_id,
+            payload_schema_version,
+            invoker_kind,
+            invoker_id,
+            authority_epoch_id,
+            evaluated_expires_at,
+            on_behalf_of,
+            decision_source_hash,
+            operation_id,
+            operation_id,
+            request_hash,
+            operation_id,
+            admission_id,
+        ),
+    )
+    db.execute(
+        """
+        INSERT INTO event_targets(
+            event_id, aggregate_type, aggregate_id, role
+        ) VALUES (?, ?, ?, ?)
+        """,
+        (
+            event_id,
+            str(event[0]),
+            str(event[1]),
+            "operation" if str(event[0]) in {"migration", "operation"} else "target",
+        ),
+    )
+
+
+def _record_migration_operation_and_envelopes(
+    db: sqlite3.Connection,
+    *,
+    operation_id: str,
+    request_hash: str,
+    invoker_id: str,
+    admission_event_id: int | None,
+    boundary_event_id: int,
+    occurred_at: str,
+    source_schema: int,
+    legacy_high_water: int,
+    snapshot_digest: str,
+    backup_digest: str,
+    target_schema: int = CURRENT_SCHEMA_VERSION,
+) -> None:
+    cleanup = db.execute(
+        """
+        SELECT status, completed_event_id, completed_at
+        FROM migration_cleanup
+        WHERE operation_id=?
+        """,
+        (operation_id,),
+    ).fetchone()
+    if cleanup is None:
+        raise JournalError("migration cleanup projection is missing")
+    completed = str(cleanup[0]) == "completed"
+    completed_event_id = int(cleanup[1]) if completed and cleanup[1] is not None else None
+    completed_at = str(cleanup[2]) if completed and cleanup[2] is not None else None
+    if completed and (completed_event_id is None or completed_at is None):
+        raise JournalError("completed migration cleanup projection is incomplete")
+    outcome = _canonical_json(
+        {
+            "backup_digest": backup_digest,
+            "boundary_event_id": boundary_event_id,
+            "legacy_high_water_event_id": legacy_high_water,
+            "snapshot_digest": snapshot_digest,
+            "source_schema": source_schema,
+            "target_schema": target_schema,
+        }
+    )
+    db.execute(
+        """
+        INSERT INTO operations(
+            operation_id, action, request_hash, invoker_kind, invoker_id,
+            status, admission_event_id, completed_event_id, outcome,
+            created_at, completed_at
+        ) VALUES (?, 'journal.migrate', ?, 'maintenance_operator', ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            operation_id,
+            request_hash,
+            invoker_id,
+            "completed" if completed else "admitted",
+            admission_event_id,
+            completed_event_id,
+            outcome,
+            occurred_at,
+            completed_at,
+        ),
+    )
+    db.execute(
+        """
+        INSERT INTO operation_targets(
+            operation_id, aggregate_type, aggregate_id, role,
+            expected_revision, observed_revision
+        ) VALUES (?, 'migration', ?, 'write', 0, 0)
+        """,
+        (operation_id, operation_id),
+    )
+    rows = db.execute(
+        """
+        SELECT id, kind
+        FROM events
+        WHERE id >= ?
+        ORDER BY id
+        """,
+        (admission_event_id if admission_event_id is not None else boundary_event_id,),
+    ).fetchall()
+    for event_id, kind in rows:
+        is_admission = admission_event_id is not None and int(event_id) == admission_event_id
+        _insert_event_envelope(
+            db,
+            event_id=int(event_id),
+            invoker_kind=(
+                "maintenance_operator"
+                if is_admission or str(kind) == "migration.boundary"
+                else "migration"
+            ),
+            invoker_id=(
+                invoker_id if is_admission or str(kind) == "migration.boundary" else operation_id
+            ),
+            operation_id=operation_id,
+            request_hash=request_hash,
+            admission_id=(
+                None if is_admission or admission_event_id is None else admission_event_id
+            ),
+        )
 
 
 def _advance_aggregate_revision(
@@ -2167,6 +2937,944 @@ def _replay_migration(
     )
 
 
+def _schema3_transition_details(db: sqlite3.Connection) -> dict[str, object]:
+    tables = {
+        str(row[0])
+        for row in db.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type='table' AND name NOT LIKE 'sqlite_%'
+            """
+        ).fetchall()
+    }
+    if tables != SCHEMA3_REQUIRED_TABLES:
+        missing = sorted(SCHEMA3_REQUIRED_TABLES - tables)
+        unexpected = sorted(tables - SCHEMA3_REQUIRED_TABLES)
+        raise MigrationRejected(
+            f"transitional schema 3 structure mismatch; missing={missing}, unexpected={unexpected}"
+        )
+    revision_columns = [
+        (str(row[1]), str(row[2]).upper(), int(row[3]))
+        for row in db.execute("PRAGMA table_info(aggregate_revisions)").fetchall()
+    ]
+    if revision_columns != [
+        ("aggregate_type", "TEXT", 1),
+        ("aggregate_id", "TEXT", 1),
+        ("revision", "INTEGER", 1),
+        ("snapshot_digest", "TEXT", 1),
+        ("source_event_id", "INTEGER", 1),
+    ]:
+        raise MigrationRejected("transitional schema 3 revision projection is not canonical")
+    boundaries = db.execute(
+        """
+        SELECT id, aggregate_id, payload, occurred_at
+        FROM events
+        WHERE kind='migration.boundary'
+        ORDER BY id
+        """
+    ).fetchall()
+    if len(boundaries) != 1:
+        raise MigrationRejected("transitional schema 3 requires one migration boundary")
+    boundary_event_id = int(boundaries[0][0])
+    try:
+        payload = json.loads(str(boundaries[0][2]))
+    except json.JSONDecodeError as exc:
+        raise MigrationRejected("transitional migration boundary payload is invalid") from exc
+    required_payload = {
+        "backup_digest",
+        "invoker",
+        "legacy_high_water_event_id",
+        "operation_id",
+        "request_hash",
+        "snapshot_digest",
+        "source_schema",
+        "target_schema",
+    }
+    if set(payload) != required_payload:
+        raise MigrationRejected("transitional migration boundary payload is incomplete")
+    if payload["target_schema"] != 3:
+        raise MigrationRejected("transitional migration boundary does not target schema 3")
+    operation_id = _required_migration_operation_id(payload["operation_id"])
+    if str(boundaries[0][1]) != operation_id:
+        raise MigrationRejected("transitional migration operation identity is inconsistent")
+    if not _valid_sha256(payload["request_hash"]):
+        raise MigrationRejected("transitional migration request hash is invalid")
+    if not _valid_sha256(payload["snapshot_digest"]):
+        raise MigrationRejected("transitional migration snapshot digest is invalid")
+    if not _valid_sha256(payload["backup_digest"]):
+        raise MigrationRejected("transitional migration backup digest is invalid")
+    if type(payload["source_schema"]) is not int or payload["source_schema"] not in {1, 2}:
+        raise MigrationRejected("transitional migration source schema is invalid")
+    if (
+        type(payload["legacy_high_water_event_id"]) is not int
+        or payload["legacy_high_water_event_id"] < 0
+        or boundary_event_id != payload["legacy_high_water_event_id"] + 1
+    ):
+        raise MigrationRejected("transitional migration boundary ordering is invalid")
+    observed_structure = _structural_fingerprint(db)
+    expected_structure = SCHEMA3_STRUCTURE_FINGERPRINTS[int(payload["source_schema"])]
+    if observed_structure != expected_structure:
+        raise MigrationRejected(
+            "transitional schema 3 structure does not match the committed M1a schema"
+        )
+    unknown = db.execute(
+        f"""
+        SELECT id, kind
+        FROM events
+        WHERE id >= ?
+          AND kind NOT IN ({",".join("?" for _ in SCHEMA3_POST_BOUNDARY_EVENT_KINDS)})
+        ORDER BY id
+        """,
+        (boundary_event_id, *sorted(SCHEMA3_POST_BOUNDARY_EVENT_KINDS)),
+    ).fetchall()
+    if unknown:
+        raise MigrationRejected(
+            "transitional schema 3 contains an unknown post-boundary event kind"
+        )
+    event_columns = [str(row[1]) for row in db.execute("PRAGMA table_info(events)").fetchall()]
+    for row in db.execute(
+        "SELECT * FROM events WHERE id >= ? ORDER BY id",
+        (boundary_event_id,),
+    ).fetchall():
+        for column, value in zip(event_columns, row, strict=True):
+            reason = _sqlite_value_policy_reason(column, value)
+            if reason is not None:
+                raise MigrationRejected(
+                    "transitional schema 3 contains a policy-unsafe post-boundary event"
+                )
+    invoker = payload.get("invoker")
+    if not isinstance(invoker, dict) or set(invoker) != {"id", "kind"}:
+        raise MigrationRejected("transitional migration invoker is invalid")
+    if invoker.get("kind") != "maintenance_operator":
+        raise MigrationRejected("transitional migration invoker kind is invalid")
+    invoker_id = _required_migration_invoker_id(invoker.get("id"))
+    original_request = MigrationRequest(
+        operation_id=operation_id,
+        invoker_id=invoker_id,
+        expected_schema=int(payload["source_schema"]),
+        expected_root_state="quiesced",
+        expected_high_water_event_id=int(payload["legacy_high_water_event_id"]),
+    )
+    if _request_hash(original_request) != payload["request_hash"]:
+        raise MigrationRejected("transitional migration request provenance is invalid")
+    try:
+        boundary_time = datetime.fromisoformat(str(boundaries[0][3]).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise MigrationRejected("transitional migration boundary time is invalid") from exc
+    if boundary_time.tzinfo is None or boundary_time.utcoffset() is None:
+        raise MigrationRejected("transitional migration boundary time is not timezone-aware")
+    return {
+        "backup_digest": str(payload["backup_digest"]),
+        "boundary_event_id": boundary_event_id,
+        "invoker_id": invoker_id,
+        "legacy_high_water_event_id": int(payload["legacy_high_water_event_id"]),
+        "occurred_at": str(boundaries[0][3]),
+        "operation_id": operation_id,
+        "request_hash": str(payload["request_hash"]),
+        "snapshot_digest": str(payload["snapshot_digest"]),
+        "source_schema": int(payload["source_schema"]),
+    }
+
+
+def _verify_schema3_transition_closure(
+    db: sqlite3.Connection,
+    root: Path,
+    transition: Mapping[str, object],
+) -> None:
+    _verify_recorded_migration_effects(
+        db,
+        root,
+        str(transition["operation_id"]),
+        str(transition["snapshot_digest"]),
+        str(transition["backup_digest"]),
+    )
+    if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise JournalError("transitional schema 3 integrity check failed")
+    if db.execute("PRAGMA foreign_key_check").fetchall():
+        raise JournalError("transitional schema 3 foreign-key check failed")
+
+
+def _schema3_upgrade_high_water_matches(
+    db: sqlite3.Connection,
+    transition: Mapping[str, object],
+    expected_high_water_event_id: int,
+) -> bool:
+    observed = _high_water_event_id(db)
+    if observed == expected_high_water_event_id:
+        return True
+    cleanup = db.execute(
+        """
+        SELECT status, completed_event_id
+        FROM migration_cleanup
+        WHERE operation_id=?
+        """,
+        (str(transition["operation_id"]),),
+    ).fetchone()
+    if (
+        cleanup is None
+        or str(cleanup[0]) != "completed"
+        or cleanup[1] is None
+        or int(cleanup[1]) != observed
+        or expected_high_water_event_id + 1 != observed
+    ):
+        return False
+    event = db.execute(
+        """
+        SELECT kind, aggregate_type, aggregate_id
+        FROM events
+        WHERE id=?
+        """,
+        (observed,),
+    ).fetchone()
+    return event == (
+        "migration.cleanup_completed",
+        "migration",
+        str(transition["operation_id"]),
+    )
+
+
+def _finish_schema3_quarantine_cleanup(
+    root: Path,
+    db: sqlite3.Connection,
+    transition: Mapping[str, object],
+    clock: Callable[[], datetime],
+) -> bool:
+    """Complete an admitted M1a cleanup without inventing a v2 admission envelope."""
+
+    operation_id = str(transition["operation_id"])
+    cleanup = db.execute(
+        """
+        SELECT status, pending_items
+        FROM migration_cleanup
+        WHERE operation_id=?
+        """,
+        (operation_id,),
+    ).fetchone()
+    if cleanup is None:
+        raise JournalError("transitional migration cleanup projection is missing")
+    if str(cleanup[0]) == "completed":
+        return False
+    completed_at = clock()
+    if completed_at.tzinfo is None or completed_at.utcoffset() is None:
+        raise MigrationRejected("migration clock must return a timezone-aware datetime")
+    completed_at_text = completed_at.isoformat(timespec="milliseconds")
+    _remove_quarantined_artifact_sources(root, db)
+
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        if _schema3_transition_details(db) != dict(transition):
+            raise MigrationRejected("transitional journal changed during cleanup recovery")
+        status = db.execute(
+            """
+            SELECT status
+            FROM migration_cleanup
+            WHERE operation_id=?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if status is None or str(status[0]) != "pending":
+            raise MigrationRejected("transitional migration cleanup status changed")
+        completed_event_id = _append_migration_event(
+            db,
+            completed_at_text,
+            "migration.cleanup_completed",
+            "migration",
+            operation_id,
+            {
+                "operation_id": operation_id,
+                "removed_items": int(cleanup[1]),
+            },
+        )
+        cursor = db.execute(
+            """
+            UPDATE migration_cleanup
+            SET status='completed', completed_at=?, completed_event_id=?
+            WHERE operation_id=? AND status='pending'
+            """,
+            (completed_at_text, completed_event_id, operation_id),
+        )
+        if cursor.rowcount != 1:
+            raise JournalError("transitional migration cleanup status changed concurrently")
+    except Exception:
+        db.rollback()
+        raise
+    else:
+        db.commit()
+    return True
+
+
+def _upgrade_schema3_tables(db: sqlite3.Connection) -> None:
+    db.execute("ALTER TABLE aggregate_revisions RENAME TO aggregate_revisions_schema3")
+    db.execute(
+        """
+        CREATE TABLE aggregate_revisions (
+            aggregate_type TEXT NOT NULL,
+            aggregate_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            snapshot_digest TEXT REFERENCES migration_snapshots(digest),
+            genesis_event_id INTEGER REFERENCES events(id),
+            source_event_id INTEGER NOT NULL REFERENCES events(id),
+            PRIMARY KEY (aggregate_type, aggregate_id),
+            CHECK (
+                (snapshot_digest IS NOT NULL AND genesis_event_id IS NULL)
+                OR
+                (snapshot_digest IS NULL AND genesis_event_id IS NOT NULL)
+            )
+        )
+        """
+    )
+    db.execute(
+        """
+        INSERT INTO aggregate_revisions(
+            aggregate_type, aggregate_id, revision, snapshot_digest,
+            genesis_event_id, source_event_id
+        )
+        SELECT aggregate_type, aggregate_id, revision, snapshot_digest, NULL, source_event_id
+        FROM aggregate_revisions_schema3
+        """
+    )
+    db.execute("DROP TABLE aggregate_revisions_schema3")
+    _create_v2_core_tables(db)
+
+
+def _replay_schema3_upgrade(
+    db: sqlite3.Connection,
+    root: Path,
+    database_identity: tuple[int, int],
+    request: MigrationRequest,
+    request_hash: str,
+) -> SchemaUpgradeOutcome:
+    operation = db.execute(
+        """
+        SELECT action, request_hash, outcome, completed_event_id
+        FROM operations
+        WHERE operation_id=?
+        """,
+        (request.operation_id,),
+    ).fetchone()
+    if operation is None or str(operation[0]) != "journal.upgrade_schema":
+        raise MigrationRejected(
+            "current-schema root has no schema-upgrade outcome for this operation"
+        )
+    if str(operation[1]) != request_hash:
+        raise MigrationRejected("operation_id was already used for a different upgrade request")
+    try:
+        outcome = json.loads(str(operation[2]))
+    except json.JSONDecodeError as exc:
+        raise MigrationRejected("recorded schema-upgrade outcome is invalid") from exc
+    tables = {
+        str(row[0])
+        for row in db.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name NOT LIKE 'sqlite_%'
+            """
+        ).fetchall()
+    }
+    if not tables >= CURRENT_REQUIRED_TABLES:
+        raise JournalError("current journal structure is incomplete")
+    _verify_v2_event_closure(db)
+    _verify_canonical_cas_closure(db, root)
+    backup_record = db.execute(
+        """
+        SELECT snapshot_digest
+        FROM migration_backups
+        WHERE digest=? AND boundary_event_id=?
+        """,
+        (str(outcome["backup_digest"]), int(operation[3])),
+    ).fetchone()
+    if backup_record is None:
+        raise JournalError("recorded schema-upgrade backup projection is missing")
+    _verify_backup_database(
+        _backup_path(root, request.operation_id, str(backup_record[0])),
+        str(outcome["backup_digest"]),
+        root.parent,
+    )
+    if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise JournalError("schema-upgrade replay integrity check failed")
+    if db.execute("PRAGMA foreign_key_check").fetchall():
+        raise JournalError("schema-upgrade replay foreign-key check failed")
+    _require_database_path_identity(root / "aos.db", database_identity)
+    _checkpoint_and_fsync_database(db, root / "aos.db", database_identity)
+    return SchemaUpgradeOutcome(
+        status="replayed",
+        operation_id=request.operation_id,
+        source_schema=int(outcome["source_schema"]),
+        target_schema=int(outcome["target_schema"]),
+        legacy_high_water_event_id=int(outcome["legacy_high_water_event_id"]),
+        upgrade_event_id=int(operation[3]),
+        backup_digest=str(outcome["backup_digest"]),
+    )
+
+
+def _replay_initialization(
+    db: sqlite3.Connection,
+    request: InitializationRequest,
+    request_hash: str,
+) -> InitializationOutcome:
+    if _schema_version(db) != CURRENT_SCHEMA_VERSION:
+        raise MigrationRejected("nonempty root requires explicit migration, not initialization")
+    operation = db.execute(
+        """
+        SELECT action, request_hash, admission_event_id, completed_event_id
+        FROM operations
+        WHERE operation_id=?
+        """,
+        (request.operation_id,),
+    ).fetchone()
+    if operation is None or str(operation[0]) != "journal.initialize":
+        raise MigrationRejected("initialization permanently refuses a nonempty root")
+    if str(operation[1]) != request_hash:
+        raise MigrationRejected(
+            "operation_id was already used for a different initialization request"
+        )
+    if operation[2] is None or operation[3] is None:
+        raise JournalError("recorded initialization outcome is incomplete")
+    admission = db.execute(
+        """
+        SELECT e.kind, envelope.admission_id
+        FROM events AS e
+        JOIN event_envelopes AS envelope ON envelope.event_id=e.id
+        WHERE e.id=?
+        """,
+        (int(operation[2]),),
+    ).fetchone()
+    initialized = db.execute(
+        """
+        SELECT e.kind, e.aggregate_type, e.aggregate_id, envelope.admission_id
+        FROM events AS e
+        JOIN event_envelopes AS envelope ON envelope.event_id=e.id
+        WHERE e.id=?
+        """,
+        (int(operation[3]),),
+    ).fetchone()
+    if admission != ("gate.admitted", None):
+        raise JournalError("recorded initialization admission is invalid")
+    if initialized != (
+        "journal.initialized",
+        "journal",
+        "root",
+        int(operation[2]),
+    ):
+        raise JournalError("recorded initialization event is invalid")
+    _verify_v2_event_closure(db)
+    _verify_canonical_cas_closure(db, Path(db.execute("PRAGMA database_list").fetchone()[2]).parent)
+    if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise JournalError("initialization replay integrity check failed")
+    if db.execute("PRAGMA foreign_key_check").fetchall():
+        raise JournalError("initialization replay foreign-key check failed")
+    return InitializationOutcome(
+        status="replayed",
+        operation_id=request.operation_id,
+        schema_version=CURRENT_SCHEMA_VERSION,
+        initialization_event_id=int(operation[3]),
+    )
+
+
+def _replay_existing_initialization(
+    db_path: Path,
+    request: InitializationRequest,
+    request_hash: str,
+) -> InitializationOutcome:
+    database_identity = _validate_sqlite_source_files(db_path)
+    with closing(sqlite3.connect(db_path)) as db:
+        db.execute("PRAGMA foreign_keys=ON")
+        outcome = _replay_initialization(db, request, request_hash)
+        journal_mode_rows = db.execute("PRAGMA journal_mode=WAL").fetchall()
+        journal_mode = str(journal_mode_rows[0][0])
+        if journal_mode != "wal":
+            raise JournalError("initialized journal could not enable WAL mode")
+        _require_database_path_identity(db_path, database_identity)
+    _require_database_path_identity(db_path, database_identity)
+    with closing(sqlite3.connect(db_path)) as sync_db:
+        _checkpoint_and_fsync_database(sync_db, db_path, database_identity)
+    return outcome
+
+
+def initialize_root(
+    root: Path,
+    request: InitializationRequest,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+) -> InitializationOutcome:
+    """Initialize exactly one empty root under narrow maintenance authority."""
+
+    operation_id = _required_migration_operation_id(request.operation_id)
+    invoker_id = _required_migration_invoker_id(request.invoker_id)
+    if type(request.expected_schema) is not int or request.expected_schema != 0:
+        raise MigrationRejected("initialization requires expected_schema=0")
+    if request.expected_root_state != "empty":
+        raise MigrationRejected("expected_root_state must explicitly be 'empty'")
+    occurred_at = clock()
+    if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+        raise MigrationRejected("initialization clock must return a timezone-aware datetime")
+    occurred_at_text = occurred_at.isoformat(timespec="milliseconds")
+    request_hash = _initialization_request_hash(request)
+
+    requested_root = Path(root).expanduser()
+    if requested_root.is_symlink():
+        raise MigrationRejected("initialization root must not be a symbolic link")
+    root_path = requested_root.resolve()
+    db_path = root_path / "aos.db"
+    if root_path.exists():
+        if not root_path.is_dir():
+            raise MigrationRejected("initialization root must be a directory")
+        if db_path.exists() or db_path.is_symlink():
+            return _replay_existing_initialization(db_path, request, request_hash)
+        if any(root_path.iterdir()):
+            raise MigrationRejected("initialization permanently refuses a nonempty root")
+    else:
+        root_path.mkdir(parents=True, mode=0o700)
+    os.chmod(root_path, 0o700)
+
+    stage_descriptor, stage_name = tempfile.mkstemp(
+        prefix=".aos-initialize-",
+        suffix=".sqlite3",
+        dir=root_path,
+    )
+    stage_path = Path(stage_name)
+    os.fchmod(stage_descriptor, 0o600)
+    os.close(stage_descriptor)
+    stage_identity = _database_path_identity(stage_path)
+    installed_identity: tuple[int, int] | None = None
+    initialization_event_id: int | None = None
+    try:
+        with closing(sqlite3.connect(stage_path)) as db:
+            db.execute("PRAGMA foreign_keys=ON")
+            journal_mode_rows = db.execute("PRAGMA journal_mode=DELETE").fetchall()
+            journal_mode = str(journal_mode_rows[0][0])
+            if journal_mode != "delete":
+                raise JournalError("initialization staging could not use rollback mode")
+            db.execute("BEGIN IMMEDIATE")
+            _create_empty_base_tables(db)
+            _create_durable_projection_tables(db)
+            _create_migration_tables(db)
+            db.execute(
+                "INSERT INTO metadata(key, value) VALUES('schema_version', ?)",
+                (str(CURRENT_SCHEMA_VERSION),),
+            )
+            admission_event_id = _append_raw_event(
+                db,
+                occurred_at=occurred_at_text,
+                kind="gate.admitted",
+                severity="info",
+                aggregate_type="operation",
+                aggregate_id=operation_id,
+                payload={
+                    "action": "journal.initialize",
+                    "targets": [
+                        {
+                            "aggregate_id": "root",
+                            "aggregate_type": "journal",
+                            "expected_revision": 0,
+                            "role": "write",
+                        }
+                    ],
+                },
+            )
+            initialization_event_id = _append_migration_event(
+                db,
+                occurred_at_text,
+                "journal.initialized",
+                "journal",
+                "root",
+                {
+                    "operation_id": operation_id,
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                },
+            )
+            outcome = _canonical_json(
+                {
+                    "initialization_event_id": initialization_event_id,
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                }
+            )
+            db.execute(
+                """
+                INSERT INTO operations(
+                    operation_id, action, request_hash, invoker_kind, invoker_id,
+                    status, admission_event_id, completed_event_id, outcome,
+                    created_at, completed_at
+                ) VALUES (
+                    ?, 'journal.initialize', ?, 'maintenance_operator', ?,
+                    'completed', ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    operation_id,
+                    request_hash,
+                    invoker_id,
+                    admission_event_id,
+                    initialization_event_id,
+                    outcome,
+                    occurred_at_text,
+                    occurred_at_text,
+                ),
+            )
+            db.execute(
+                """
+                INSERT INTO operation_targets(
+                    operation_id, aggregate_type, aggregate_id, role,
+                    expected_revision, observed_revision
+                ) VALUES (?, 'journal', 'root', 'write', 0, 0)
+                """,
+                (operation_id,),
+            )
+            _insert_event_envelope(
+                db,
+                event_id=admission_event_id,
+                invoker_kind="maintenance_operator",
+                invoker_id=invoker_id,
+                operation_id=operation_id,
+                request_hash=request_hash,
+                admission_id=None,
+            )
+            _insert_event_envelope(
+                db,
+                event_id=initialization_event_id,
+                invoker_kind="maintenance_operator",
+                invoker_id=invoker_id,
+                operation_id=operation_id,
+                request_hash=request_hash,
+                admission_id=admission_event_id,
+            )
+            db.execute(
+                """
+                INSERT INTO aggregate_revisions(
+                    aggregate_type, aggregate_id, revision, snapshot_digest,
+                    genesis_event_id, source_event_id
+                ) VALUES ('journal', 'root', 1, NULL, ?, ?)
+                """,
+                (initialization_event_id, initialization_event_id),
+            )
+            if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise JournalError("initialized journal integrity check failed")
+            if db.execute("PRAGMA foreign_key_check").fetchall():
+                raise JournalError("initialized journal foreign-key check failed")
+            db.commit()
+            _verify_v2_event_closure(db)
+            _checkpoint_and_fsync_database(db, stage_path, stage_identity)
+
+        _remove_temporary_sqlite_files(stage_path, include_main=False)
+        _require_database_path_identity(stage_path, stage_identity)
+        unexpected = sorted(
+            candidate.name for candidate in root_path.iterdir() if candidate != stage_path
+        )
+        if unexpected:
+            if unexpected == ["aos.db"]:
+                _unlink_path_if_identity(stage_path, stage_identity)
+                return _replay_existing_initialization(db_path, request, request_hash)
+            raise MigrationRejected(
+                "initialization root stopped being empty before journal installation"
+            )
+        try:
+            os.link(stage_path, db_path, follow_symlinks=False)
+        except FileExistsError:
+            _unlink_path_if_identity(stage_path, stage_identity)
+            return _replay_existing_initialization(db_path, request, request_hash)
+        installed_identity = stage_identity
+        if not _unlink_path_if_identity(stage_path, stage_identity):
+            raise JournalError("initialization staging database identity changed")
+        _fsync_directory(root_path)
+        _require_database_path_identity(db_path, installed_identity)
+        replayed = _replay_existing_initialization(db_path, request, request_hash)
+        if replayed.initialization_event_id != initialization_event_id:
+            raise JournalError("installed initialization outcome changed")
+    except Exception:
+        with suppress(JournalError):
+            _remove_temporary_sqlite_files(stage_path, include_main=False)
+        removed = _unlink_path_if_identity(stage_path, stage_identity)
+        if installed_identity is not None:
+            removed = _unlink_path_if_identity(db_path, installed_identity) or removed
+        if removed:
+            _fsync_directory(root_path)
+        raise
+    if initialization_event_id is None:
+        raise JournalError("initialization did not record its journal event")
+    return InitializationOutcome(
+        status="completed",
+        operation_id=operation_id,
+        schema_version=CURRENT_SCHEMA_VERSION,
+        initialization_event_id=initialization_event_id,
+    )
+
+
+def upgrade_schema3_root(
+    root: Path,
+    request: MigrationRequest,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+) -> SchemaUpgradeOutcome:
+    """Explicitly upgrade the finite M1a schema-3 transition into schema 4."""
+
+    operation_id = _required_migration_operation_id(request.operation_id)
+    invoker_id = _required_migration_invoker_id(request.invoker_id)
+    if request.expected_schema != 3:
+        raise MigrationRejected("schema-3 upgrade requires expected_schema=3")
+    if (
+        type(request.expected_high_water_event_id) is not int
+        or request.expected_high_water_event_id < 0
+    ):
+        raise MigrationRejected("expected_high_water_event_id must be a nonnegative integer")
+    if request.expected_root_state != "quiesced":
+        raise MigrationRejected("expected_root_state must explicitly be 'quiesced'")
+    occurred_at = clock()
+    if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+        raise MigrationRejected("migration clock must return a timezone-aware datetime")
+    occurred_at_text = occurred_at.isoformat(timespec="milliseconds")
+    request_hash = _request_hash(request)
+    db_path = Path(root).expanduser().resolve() / "aos.db"
+
+    with _readonly_database_snapshot(db_path) as preflight:
+        schema = _schema_version(preflight)
+        if schema == CURRENT_SCHEMA_VERSION:
+            pass
+        elif schema != 3:
+            raise MigrationRejected(f"schema-3 upgrade observed unsupported schema {schema}")
+        else:
+            high_water = _high_water_event_id(preflight)
+            preflight_transition = _schema3_transition_details(preflight)
+            if not _schema3_upgrade_high_water_matches(
+                preflight,
+                preflight_transition,
+                request.expected_high_water_event_id,
+            ):
+                raise MigrationRejected(
+                    "expected event high-water "
+                    f"{request.expected_high_water_event_id}, observed {high_water}"
+                )
+            _verify_schema3_transition_closure(
+                preflight,
+                db_path.parent,
+                preflight_transition,
+            )
+            if _live_legacy_processes(preflight):
+                raise MigrationRejected("legacy process is still live during schema-3 upgrade")
+            if _live_legacy_daemon(db_path.parent) is not None:
+                raise MigrationRejected("legacy daemon is still live during schema-3 upgrade")
+
+    database_identity = _validate_sqlite_source_files(db_path)
+    with sqlite3.connect(db_path) as db:
+        _require_database_path_identity(db_path, database_identity)
+        db.execute("PRAGMA foreign_keys=ON")
+        source_schema = _schema_version(db)
+        if source_schema == CURRENT_SCHEMA_VERSION:
+            return _replay_schema3_upgrade(
+                db,
+                db_path.parent,
+                database_identity,
+                request,
+                request_hash,
+            )
+        if source_schema != 3:
+            raise MigrationRejected(f"schema-3 upgrade observed unsupported schema {source_schema}")
+        legacy_high_water = _high_water_event_id(db)
+        transition = _schema3_transition_details(db)
+        if not _schema3_upgrade_high_water_matches(
+            db,
+            transition,
+            request.expected_high_water_event_id,
+        ):
+            raise MigrationRejected("journal changed during schema-3 upgrade admission")
+        _verify_schema3_transition_closure(db, db_path.parent, transition)
+        recovered_cleanup = _finish_schema3_quarantine_cleanup(
+            db_path.parent,
+            db,
+            transition,
+            clock,
+        )
+        if recovered_cleanup:
+            _require_database_path_identity(db_path, database_identity)
+            transition = _schema3_transition_details(db)
+            _verify_schema3_transition_closure(db, db_path.parent, transition)
+            if not _schema3_upgrade_high_water_matches(
+                db,
+                transition,
+                request.expected_high_water_event_id,
+            ):
+                raise MigrationRejected("schema-3 cleanup recovery changed unexpected events")
+            legacy_high_water = _high_water_event_id(db)
+        snapshot_digest = str(transition["snapshot_digest"])
+        upgrade_backup_path, backup_digest = _backup_legacy_database(
+            db,
+            db_path.parent,
+            operation_id,
+            snapshot_digest,
+        )
+        _verify_backup_database(
+            upgrade_backup_path,
+            backup_digest,
+            db_path.parent.parent,
+        )
+
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            if (
+                _schema_version(db) != 3
+                or _high_water_event_id(db) != legacy_high_water
+                or _schema3_transition_details(db) != transition
+            ):
+                raise MigrationRejected("journal changed during schema-3 upgrade admission")
+            _verify_schema3_transition_closure(db, db_path.parent, transition)
+            _upgrade_schema3_tables(db)
+            _record_migration_operation_and_envelopes(
+                db,
+                operation_id=str(transition["operation_id"]),
+                request_hash=str(transition["request_hash"]),
+                invoker_id=str(transition["invoker_id"]),
+                admission_event_id=None,
+                boundary_event_id=int(transition["boundary_event_id"]),
+                occurred_at=str(transition["occurred_at"]),
+                source_schema=int(transition["source_schema"]),
+                legacy_high_water=int(transition["legacy_high_water_event_id"]),
+                snapshot_digest=snapshot_digest,
+                backup_digest=str(transition["backup_digest"]),
+                target_schema=3,
+            )
+            upgrade_admission_event_id = _append_raw_event(
+                db,
+                occurred_at=occurred_at_text,
+                kind="gate.admitted",
+                severity="info",
+                aggregate_type="operation",
+                aggregate_id=operation_id,
+                payload={
+                    "action": "journal.upgrade_schema",
+                    "targets": [
+                        {
+                            "aggregate_id": operation_id,
+                            "aggregate_type": "migration",
+                            "expected_revision": 0,
+                            "role": "write",
+                        }
+                    ],
+                },
+            )
+            upgrade_event_id = _append_migration_event(
+                db,
+                occurred_at_text,
+                "schema.upgraded",
+                "migration",
+                operation_id,
+                {
+                    "from_schema": 3,
+                    "legacy_high_water_event_id": legacy_high_water,
+                    "operation_id": operation_id,
+                    "to_schema": CURRENT_SCHEMA_VERSION,
+                },
+            )
+            outcome_payload = _canonical_json(
+                {
+                    "backup_digest": backup_digest,
+                    "legacy_high_water_event_id": legacy_high_water,
+                    "source_schema": 3,
+                    "target_schema": CURRENT_SCHEMA_VERSION,
+                    "upgrade_event_id": upgrade_event_id,
+                }
+            )
+            db.execute(
+                """
+                INSERT INTO operations(
+                    operation_id, action, request_hash, invoker_kind, invoker_id,
+                    status, admission_event_id, completed_event_id, outcome,
+                    created_at, completed_at
+                ) VALUES (
+                    ?, 'journal.upgrade_schema', ?, 'maintenance_operator', ?,
+                    'completed', ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    operation_id,
+                    request_hash,
+                    invoker_id,
+                    upgrade_admission_event_id,
+                    upgrade_event_id,
+                    outcome_payload,
+                    occurred_at_text,
+                    occurred_at_text,
+                ),
+            )
+            db.execute(
+                """
+                INSERT INTO operation_targets(
+                    operation_id, aggregate_type, aggregate_id, role,
+                    expected_revision, observed_revision
+                ) VALUES (?, 'migration', ?, 'write', 0, 0)
+                """,
+                (operation_id, operation_id),
+            )
+            _insert_event_envelope(
+                db,
+                event_id=upgrade_admission_event_id,
+                invoker_kind="maintenance_operator",
+                invoker_id=invoker_id,
+                operation_id=operation_id,
+                request_hash=request_hash,
+                admission_id=None,
+            )
+            _insert_event_envelope(
+                db,
+                event_id=upgrade_event_id,
+                invoker_kind="maintenance_operator",
+                invoker_id=invoker_id,
+                operation_id=operation_id,
+                request_hash=request_hash,
+                admission_id=upgrade_admission_event_id,
+            )
+            db.execute(
+                """
+                INSERT INTO migration_backups(
+                    digest, source_schema, legacy_high_water_event_id,
+                    snapshot_digest, boundary_event_id, created_at
+                ) VALUES (?, 3, ?, ?, ?, ?)
+                """,
+                (
+                    backup_digest,
+                    legacy_high_water,
+                    snapshot_digest,
+                    upgrade_event_id,
+                    occurred_at_text,
+                ),
+            )
+            db.execute(
+                "UPDATE metadata SET value=? WHERE key='schema_version'",
+                (str(CURRENT_SCHEMA_VERSION),),
+            )
+            _verify_v2_event_closure(db)
+            if db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise JournalError("schema-3 upgrade integrity check failed")
+            if db.execute("PRAGMA foreign_key_check").fetchall():
+                raise JournalError("schema-3 upgrade foreign-key check failed")
+            _verify_backup_database(
+                upgrade_backup_path,
+                backup_digest,
+                db_path.parent.parent,
+            )
+            _require_database_path_identity(db_path, database_identity)
+        except Exception:
+            db.rollback()
+            raise
+        else:
+            db.commit()
+        _require_database_path_identity(db_path, database_identity)
+        _verify_backup_database(
+            upgrade_backup_path,
+            backup_digest,
+            db_path.parent.parent,
+        )
+        _checkpoint_and_fsync_database(db, db_path, database_identity)
+    return SchemaUpgradeOutcome(
+        status="completed",
+        operation_id=operation_id,
+        source_schema=3,
+        target_schema=CURRENT_SCHEMA_VERSION,
+        legacy_high_water_event_id=legacy_high_water,
+        upgrade_event_id=upgrade_event_id,
+        backup_digest=backup_digest,
+    )
+
+
 def migrate_legacy_root(
     root: Path,
     request: MigrationRequest,
@@ -2384,7 +4092,30 @@ def migrate_legacy_root(
                 artifacts,
             )
 
-            boundary_event_id = legacy_high_water + 1
+            _create_migration_tables(db)
+            admission_event_id = legacy_high_water + 1
+            inserted_admission_event_id = _append_raw_event(
+                db,
+                occurred_at=occurred_at.isoformat(timespec="milliseconds"),
+                kind="gate.admitted",
+                severity="info",
+                aggregate_type="operation",
+                aggregate_id=operation_id,
+                payload={
+                    "action": "journal.migrate",
+                    "targets": [
+                        {
+                            "aggregate_id": operation_id,
+                            "aggregate_type": "migration",
+                            "expected_revision": 0,
+                            "role": "write",
+                        }
+                    ],
+                },
+            )
+            if inserted_admission_event_id != admission_event_id:
+                raise JournalError("migration admission event ordering is not deterministic")
+            boundary_event_id = legacy_high_water + 2
             db.execute(
                 """
                 INSERT INTO events(
@@ -2398,7 +4129,6 @@ def migrate_legacy_root(
                     payload,
                 ),
             )
-            _create_migration_tables(db)
             if source_schema == 1:
                 _backfill_v1_durable_objects(db)
             else:
@@ -2513,6 +4243,20 @@ def migrate_legacy_root(
                 "UPDATE metadata SET value=? WHERE key='schema_version'",
                 (str(CURRENT_SCHEMA_VERSION),),
             )
+            _record_migration_operation_and_envelopes(
+                db,
+                operation_id=operation_id,
+                request_hash=request_digest,
+                invoker_id=invoker_id,
+                admission_event_id=admission_event_id,
+                boundary_event_id=boundary_event_id,
+                occurred_at=occurred_at.isoformat(timespec="milliseconds"),
+                source_schema=source_schema,
+                legacy_high_water=legacy_high_water,
+                snapshot_digest=snapshot_digest,
+                backup_digest=backup_digest,
+            )
+            _verify_v2_event_closure(db)
 
             integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
             if integrity != "ok":
@@ -2569,3 +4313,1068 @@ def migrate_legacy_root(
         snapshot_digest=snapshot_digest,
         backup_digest=backup_digest,
     )
+
+
+@dataclass(slots=True)
+class _OperationValidationContext:
+    db: sqlite3.Connection
+    request: OperationRequest
+    observed_revisions: Mapping[tuple[str, str], int]
+    occurred_at: datetime
+
+
+class _OperationContext:
+    def __init__(
+        self,
+        *,
+        db: sqlite3.Connection,
+        request: OperationRequest,
+        request_hash: str,
+        admission_event_id: int,
+        occurred_at: str,
+        evaluated_expires_at: str | None,
+        expected_revisions: tuple[ExpectedRevision, ...],
+        fault_injector: Callable[[str], None] | None,
+    ) -> None:
+        self.db = db
+        self.request = request
+        self.request_hash = request_hash
+        self.admission_event_id = admission_event_id
+        self.occurred_at = occurred_at
+        self.evaluated_expires_at = evaluated_expires_at
+        self._expected = {
+            (item.aggregate_type, item.aggregate_id): item for item in expected_revisions
+        }
+        self._advanced: set[tuple[str, str]] = set()
+        self._event_ids: list[int] = []
+        self._fault_injector = fault_injector
+
+    @property
+    def event_ids(self) -> tuple[int, ...]:
+        return tuple(self._event_ids)
+
+    def _append(
+        self,
+        *,
+        kind: str,
+        severity: str,
+        aggregate_type: str,
+        aggregate_id: str,
+        payload: Mapping[str, object],
+        payload_schema_version: int,
+    ) -> EventRecord:
+        _require_safe_operation_json(payload, "event payload")
+        cursor = self.db.execute(
+            """
+            INSERT INTO events(
+                occurred_at, kind, severity, aggregate_type, aggregate_id, payload
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                self.occurred_at,
+                kind,
+                severity,
+                aggregate_type,
+                aggregate_id,
+                _canonical_json(dict(payload)),
+            ),
+        )
+        event_id = int(cursor.lastrowid)
+        _insert_event_envelope(
+            self.db,
+            event_id=event_id,
+            invoker_kind=self.request.invoker.kind,
+            invoker_id=self.request.invoker.id,
+            authority_epoch_id=self.request.invoker.authority_epoch_id,
+            evaluated_expires_at=self.evaluated_expires_at,
+            on_behalf_of=self.request.invoker.on_behalf_of,
+            decision_source_hash=self.request.invoker.decision_source_hash,
+            operation_id=self.request.operation_id,
+            request_hash=self.request_hash,
+            admission_id=self.admission_event_id,
+            payload_schema_version=payload_schema_version,
+        )
+        self._event_ids.append(event_id)
+        if self._fault_injector is not None:
+            self._fault_injector("after_domain_event")
+        return EventRecord(
+            event_id=event_id,
+            occurred_at=self.occurred_at,
+            kind=kind,
+            severity=severity,
+            aggregate_type=aggregate_type,
+            aggregate_id=aggregate_id,
+            payload=dict(payload),
+            envelope={
+                "admission_id": self.admission_event_id,
+                "authority_epoch_id": self.request.invoker.authority_epoch_id,
+                "causation_id": self.request.operation_id,
+                "decision_source_hash": self.request.invoker.decision_source_hash,
+                "envelope_version": 1,
+                "evaluated_expires_at": self.evaluated_expires_at,
+                "invoker_id": self.request.invoker.id,
+                "invoker_kind": self.request.invoker.kind,
+                "on_behalf_of": self.request.invoker.on_behalf_of,
+                "operation_id": self.request.operation_id,
+                "payload_schema_version": payload_schema_version,
+                "request_hash": self.request_hash,
+                "request_key": self.request.operation_id,
+            },
+        )
+
+    def _advance_revision(
+        self,
+        *,
+        aggregate_type: str,
+        aggregate_id: str,
+        source_event_id: int,
+    ) -> None:
+        key = (aggregate_type, aggregate_id)
+        expected = self._expected.get(key)
+        if expected is None or expected.role != "write":
+            raise JournalError("domain event attempted to advance an undeclared writable aggregate")
+        if key in self._advanced:
+            raise JournalError("one operation cannot advance an aggregate more than once")
+        row = self.db.execute(
+            """
+            SELECT revision
+            FROM aggregate_revisions
+            WHERE aggregate_type=? AND aggregate_id=?
+            """,
+            key,
+        ).fetchone()
+        observed = 0 if row is None else int(row[0])
+        if observed != expected.revision:
+            raise JournalError("aggregate revision changed after operation admission")
+        if row is None:
+            self.db.execute(
+                """
+                INSERT INTO aggregate_revisions(
+                    aggregate_type, aggregate_id, revision, snapshot_digest,
+                    genesis_event_id, source_event_id
+                ) VALUES (?, ?, 1, NULL, ?, ?)
+                """,
+                (aggregate_type, aggregate_id, source_event_id, source_event_id),
+            )
+        else:
+            cursor = self.db.execute(
+                """
+                UPDATE aggregate_revisions
+                SET revision=revision+1, source_event_id=?
+                WHERE aggregate_type=? AND aggregate_id=? AND revision=?
+                """,
+                (
+                    source_event_id,
+                    aggregate_type,
+                    aggregate_id,
+                    expected.revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise JournalError("aggregate revision changed during domain event append")
+        self._advanced.add(key)
+
+    def append_event(
+        self,
+        kind: str,
+        aggregate_type: str,
+        aggregate_id: str,
+        payload: Mapping[str, object],
+        *,
+        severity: str = "info",
+        payload_schema_version: int = 1,
+    ) -> EventRecord:
+        """Append one module-owned reserved fact and advance its aggregate once."""
+
+        try:
+            spec = require_reserved_event(
+                kind,
+                EventAggregateType(aggregate_type),
+                payload_schema_version=payload_schema_version,
+            )
+        except (ProtocolViolation, ValueError) as exc:
+            raise InvalidOperation("reserved event violates the protocol vocabulary") from exc
+        if not spec.requires_admission:
+            raise InvalidOperation("special lifecycle facts use their dedicated journal operation")
+        event = self._append(
+            kind=kind,
+            severity=_required_event_severity(severity),
+            aggregate_type=aggregate_type,
+            aggregate_id=_required_public_identifier(aggregate_id, "aggregate_id"),
+            payload=payload,
+            payload_schema_version=payload_schema_version,
+        )
+        if spec.advances_aggregate_revision:
+            self._advance_revision(
+                aggregate_type=aggregate_type,
+                aggregate_id=aggregate_id,
+                source_event_id=event.event_id,
+            )
+        return event
+
+    def append_observation(
+        self,
+        kind: str,
+        aggregate_type: str,
+        aggregate_id: str,
+        payload: Mapping[str, object],
+        *,
+        severity: str = "info",
+    ) -> EventRecord:
+        """Append a nonconstitutional observation without changing a revision."""
+
+        try:
+            require_generic_event_kind(kind)
+        except ProtocolViolation as exc:
+            raise InvalidOperation("generic append cannot emit a reserved event kind") from exc
+        return self._append(
+            kind=kind,
+            severity=_required_event_severity(severity),
+            aggregate_type=_required_public_identifier(
+                aggregate_type,
+                "aggregate_type",
+            ),
+            aggregate_id=_required_public_identifier(aggregate_id, "aggregate_id"),
+            payload=payload,
+            payload_schema_version=1,
+        )
+
+
+def _required_public_identifier(value: object, label: str) -> str:
+    if not isinstance(value, str) or PUBLIC_IDENTIFIER_PATTERN.fullmatch(value) is None:
+        raise InvalidOperation(f"{label} must be a bounded nonsecret identifier")
+    if _content_policy_reason(value.encode("utf-8")) is not None:
+        raise InvalidOperation(f"{label} must be a bounded nonsecret identifier")
+    return value
+
+
+def _required_event_severity(value: object) -> str:
+    if value not in {"routine", "info", "attention", "warning", "error"}:
+        raise InvalidOperation("event severity is not supported")
+    return str(value)
+
+
+def _require_safe_operation_json(value: object, label: str) -> bytes:
+    encoded = canonical_json_bytes(value)
+    if _content_policy_reason(encoded) is not None:
+        raise InvalidOperation(f"{label} is policy-unsafe")
+    return encoded
+
+
+def _normalized_operation_request(
+    request: OperationRequest,
+) -> tuple[tuple[ExpectedRevision, ...], str]:
+    if not isinstance(request, OperationRequest):
+        raise InvalidOperation("operation request has the wrong type")
+    if (
+        not isinstance(request.operation_id, str)
+        or MIGRATION_OPERATION_PATTERN.fullmatch(request.operation_id) is None
+        or _content_policy_reason(request.operation_id.encode("utf-8")) is not None
+    ):
+        raise InvalidOperation("operation_id must use the nonsecret OP-[A-Z0-9_-] form")
+    if (
+        not isinstance(request.action, str)
+        or OPERATION_ACTION_PATTERN.fullmatch(request.action) is None
+    ):
+        raise InvalidOperation("action must use the lowercase namespace.name form")
+    invoker = request.invoker
+    if not isinstance(invoker, Invoker) or invoker.kind not in INVOKER_KINDS:
+        raise InvalidOperation("invoker kind is not supported")
+    _required_public_identifier(invoker.id, "invoker id")
+    if invoker.authority_epoch_id is not None:
+        _required_public_identifier(invoker.authority_epoch_id, "authority epoch id")
+    if (invoker.on_behalf_of is None) != (invoker.decision_source_hash is None):
+        raise InvalidOperation(
+            "human attribution requires both on_behalf_of and decision_source_hash"
+        )
+    if invoker.on_behalf_of is not None:
+        _required_public_identifier(invoker.on_behalf_of, "on_behalf_of")
+        if not _valid_sha256(invoker.decision_source_hash):
+            raise InvalidOperation("decision_source_hash must be canonical SHA-256")
+    if not isinstance(request.expected_revisions, tuple):
+        raise InvalidOperation("expected_revisions must be an immutable tuple")
+    normalized: list[ExpectedRevision] = []
+    seen: set[tuple[str, str]] = set()
+    for item in request.expected_revisions:
+        if not isinstance(item, ExpectedRevision):
+            raise InvalidOperation("expected revision has the wrong type")
+        aggregate_type = _required_public_identifier(
+            item.aggregate_type,
+            "expected aggregate type",
+        )
+        aggregate_id = _required_public_identifier(
+            item.aggregate_id,
+            "expected aggregate id",
+        )
+        if type(item.revision) is not int or item.revision < 0:
+            raise InvalidOperation("expected revision must be a nonnegative integer")
+        if item.role not in {"read", "write"}:
+            raise InvalidOperation("expected revision role must be read or write")
+        key = (aggregate_type, aggregate_id)
+        if key in seen:
+            raise InvalidOperation("expected revisions contain a duplicate aggregate")
+        seen.add(key)
+        normalized.append(
+            ExpectedRevision(
+                aggregate_type=aggregate_type,
+                aggregate_id=aggregate_id,
+                revision=item.revision,
+                role=item.role,
+            )
+        )
+    if not isinstance(request.payload, Mapping):
+        raise InvalidOperation("operation payload must be an object")
+    canonical_json_bytes(dict(request.payload))
+    ordered = tuple(
+        sorted(
+            normalized,
+            key=lambda item: (item.aggregate_type, item.aggregate_id),
+        )
+    )
+    request_hash = content_digest(
+        {
+            "action": request.action,
+            "expected_revisions": [
+                {
+                    "aggregate_id": item.aggregate_id,
+                    "aggregate_type": item.aggregate_type,
+                    "revision": item.revision,
+                    "role": item.role,
+                }
+                for item in ordered
+            ],
+            "invoker": {
+                "authority_epoch_id": invoker.authority_epoch_id,
+                "decision_source_hash": invoker.decision_source_hash,
+                "id": invoker.id,
+                "kind": invoker.kind,
+                "on_behalf_of": invoker.on_behalf_of,
+            },
+            "operation_id": request.operation_id,
+            "payload": dict(request.payload),
+        }
+    )
+    return ordered, request_hash
+
+
+def _outcome_payload(outcome: OperationOutcome) -> str:
+    return _canonical_json(
+        {
+            "admission_event_id": outcome.admission_event_id,
+            "domain_event_ids": list(outcome.domain_event_ids),
+            "operation_id": outcome.operation_id,
+            "reason": outcome.reason,
+            "rejection_event_id": outcome.rejection_event_id,
+            "revisions": [
+                {
+                    "aggregate_id": revision.aggregate_id,
+                    "aggregate_type": revision.aggregate_type,
+                    "revision": revision.revision,
+                    "role": revision.role,
+                }
+                for revision in outcome.revisions
+            ],
+            "status": outcome.status,
+        }
+    )
+
+
+def _outcome_from_record(
+    operation_id: str,
+    status: str,
+    payload: str,
+) -> OperationOutcome:
+    try:
+        recorded = json.loads(payload)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise JournalError("recorded operation outcome is invalid") from exc
+    revisions = tuple(
+        ExpectedRevision(
+            aggregate_type=str(item["aggregate_type"]),
+            aggregate_id=str(item["aggregate_id"]),
+            revision=int(item["revision"]),
+            role=str(item["role"]),
+        )
+        for item in recorded["revisions"]
+    )
+    return OperationOutcome(
+        status="replayed",
+        original_status=status,
+        operation_id=operation_id,
+        admission_event_id=(
+            None if recorded["admission_event_id"] is None else int(recorded["admission_event_id"])
+        ),
+        rejection_event_id=(
+            None if recorded["rejection_event_id"] is None else int(recorded["rejection_event_id"])
+        ),
+        domain_event_ids=tuple(int(item) for item in recorded["domain_event_ids"]),
+        revisions=revisions,
+        reason=None if recorded["reason"] is None else str(recorded["reason"]),
+    )
+
+
+def _observed_revisions(
+    db: sqlite3.Connection,
+    expected: tuple[ExpectedRevision, ...],
+) -> dict[tuple[str, str], int]:
+    observed: dict[tuple[str, str], int] = {}
+    for item in expected:
+        row = db.execute(
+            """
+            SELECT revision
+            FROM aggregate_revisions
+            WHERE aggregate_type=? AND aggregate_id=?
+            """,
+            (item.aggregate_type, item.aggregate_id),
+        ).fetchone()
+        observed[(item.aggregate_type, item.aggregate_id)] = 0 if row is None else int(row[0])
+    return observed
+
+
+def _result_revisions(
+    db: sqlite3.Connection,
+    expected: tuple[ExpectedRevision, ...],
+) -> tuple[ExpectedRevision, ...]:
+    observed = _observed_revisions(db, expected)
+    return tuple(
+        ExpectedRevision(
+            aggregate_type=item.aggregate_type,
+            aggregate_id=item.aggregate_id,
+            revision=observed[(item.aggregate_type, item.aggregate_id)],
+            role=item.role,
+        )
+        for item in expected
+    )
+
+
+def _insert_operation_targets(
+    db: sqlite3.Connection,
+    operation_id: str,
+    expected: tuple[ExpectedRevision, ...],
+    observed: Mapping[tuple[str, str], int],
+) -> None:
+    db.executemany(
+        """
+        INSERT INTO operation_targets(
+            operation_id, aggregate_type, aggregate_id, role,
+            expected_revision, observed_revision
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                operation_id,
+                item.aggregate_type,
+                item.aggregate_id,
+                item.role,
+                item.revision,
+                observed[(item.aggregate_type, item.aggregate_id)],
+            )
+            for item in expected
+        ],
+    )
+
+
+def _append_raw_event(
+    db: sqlite3.Connection,
+    *,
+    occurred_at: str,
+    kind: str,
+    severity: str,
+    aggregate_type: str,
+    aggregate_id: str,
+    payload: Mapping[str, object],
+) -> int:
+    _require_safe_operation_json(payload, "event payload")
+    cursor = db.execute(
+        """
+        INSERT INTO events(
+            occurred_at, kind, severity, aggregate_type, aggregate_id, payload
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            occurred_at,
+            kind,
+            severity,
+            aggregate_type,
+            aggregate_id,
+            _canonical_json(dict(payload)),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def _authority_gate(
+    db: sqlite3.Connection,
+    invoker: Invoker,
+    occurred_at: datetime,
+) -> tuple[GateRejection | None, str | None]:
+    authority_required = invoker.kind in AUTHORITY_BEARING_INVOKERS
+    if authority_required and invoker.authority_epoch_id is None:
+        return GateRejection("authority_missing", {}), None
+    if not authority_required and invoker.authority_epoch_id is not None:
+        return GateRejection("authority_not_permitted", {}), None
+    if invoker.authority_epoch_id is None:
+        return None, None
+    epoch = db.execute(
+        """
+        SELECT subject_id, expires_at, status
+        FROM authority_epochs
+        WHERE epoch_id=?
+        """,
+        (invoker.authority_epoch_id,),
+    ).fetchone()
+    if epoch is None:
+        return GateRejection("authority_unknown", {}), None
+    expires_at = str(epoch[1])
+    try:
+        expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return GateRejection("authority_invalid", {}), expires_at
+    if str(epoch[0]) != invoker.id:
+        return GateRejection("authority_scope_mismatch", {}), expires_at
+    if str(epoch[2]) != "active":
+        return GateRejection("authority_inactive", {}), expires_at
+    if expiry.tzinfo is None or expiry.utcoffset() is None or expiry <= occurred_at:
+        return GateRejection("authority_expired", {}), expires_at
+    return None, expires_at
+
+
+def _commit_new_rejection(
+    db: sqlite3.Connection,
+    *,
+    request: OperationRequest,
+    request_hash: str,
+    expected: tuple[ExpectedRevision, ...],
+    observed: Mapping[tuple[str, str], int],
+    rejection: GateRejection,
+    occurred_at: str,
+    evaluated_expires_at: str | None,
+) -> OperationOutcome:
+    _require_safe_operation_json(dict(rejection.details), "gate rejection details")
+    rejection_event_id = _append_raw_event(
+        db,
+        occurred_at=occurred_at,
+        kind="gate.rejected",
+        severity="attention",
+        aggregate_type="operation",
+        aggregate_id=request.operation_id,
+        payload={
+            "action": request.action,
+            "details": dict(rejection.details),
+            "reason": rejection.code,
+            "targets": [
+                {
+                    "aggregate_id": item.aggregate_id,
+                    "aggregate_type": item.aggregate_type,
+                    "expected_revision": item.revision,
+                    "observed_revision": observed[(item.aggregate_type, item.aggregate_id)],
+                    "role": item.role,
+                }
+                for item in expected
+            ],
+        },
+    )
+    revisions = tuple(
+        ExpectedRevision(
+            item.aggregate_type,
+            item.aggregate_id,
+            observed[(item.aggregate_type, item.aggregate_id)],
+            item.role,
+        )
+        for item in expected
+    )
+    outcome = OperationOutcome(
+        status="rejected",
+        operation_id=request.operation_id,
+        admission_event_id=None,
+        rejection_event_id=rejection_event_id,
+        domain_event_ids=(),
+        revisions=revisions,
+        reason=rejection.code,
+    )
+    db.execute(
+        """
+        INSERT INTO operations(
+            operation_id, action, request_hash, invoker_kind, invoker_id,
+            authority_epoch_id, status, rejection_event_id, outcome,
+            created_at, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, 'rejected', ?, ?, ?, ?)
+        """,
+        (
+            request.operation_id,
+            request.action,
+            request_hash,
+            request.invoker.kind,
+            request.invoker.id,
+            request.invoker.authority_epoch_id,
+            rejection_event_id,
+            _outcome_payload(outcome),
+            occurred_at,
+            occurred_at,
+        ),
+    )
+    _insert_operation_targets(
+        db,
+        request.operation_id,
+        expected,
+        observed,
+    )
+    _insert_event_envelope(
+        db,
+        event_id=rejection_event_id,
+        invoker_kind=request.invoker.kind,
+        invoker_id=request.invoker.id,
+        authority_epoch_id=request.invoker.authority_epoch_id,
+        evaluated_expires_at=evaluated_expires_at,
+        on_behalf_of=request.invoker.on_behalf_of,
+        decision_source_hash=request.invoker.decision_source_hash,
+        operation_id=request.operation_id,
+        request_hash=request_hash,
+        admission_id=None,
+    )
+    return outcome
+
+
+def _commit_operation_conflict(
+    db: sqlite3.Connection,
+    *,
+    request: OperationRequest,
+    request_hash: str,
+    occurred_at: str,
+) -> OperationOutcome:
+    existing = db.execute(
+        """
+        SELECT rejection_event_id
+        FROM operation_conflicts
+        WHERE operation_id=? AND conflicting_request_hash=?
+        """,
+        (request.operation_id, request_hash),
+    ).fetchone()
+    if existing is not None:
+        return OperationOutcome(
+            status="rejected",
+            original_status="rejected",
+            operation_id=request.operation_id,
+            admission_event_id=None,
+            rejection_event_id=int(existing[0]),
+            domain_event_ids=(),
+            revisions=(),
+            reason="operation_id_conflict",
+        )
+    rejection_event_id = _append_raw_event(
+        db,
+        occurred_at=occurred_at,
+        kind="gate.rejected",
+        severity="attention",
+        aggregate_type="operation",
+        aggregate_id=request.operation_id,
+        payload={
+            "action": request.action,
+            "conflicting_request_hash": request_hash,
+            "reason": "operation_id_conflict",
+        },
+    )
+    _insert_event_envelope(
+        db,
+        event_id=rejection_event_id,
+        invoker_kind=request.invoker.kind,
+        invoker_id=request.invoker.id,
+        authority_epoch_id=None,
+        on_behalf_of=request.invoker.on_behalf_of,
+        decision_source_hash=request.invoker.decision_source_hash,
+        operation_id=request.operation_id,
+        request_hash=request_hash,
+        admission_id=None,
+    )
+    db.execute(
+        """
+        INSERT INTO operation_conflicts(
+            operation_id, conflicting_request_hash, rejection_event_id, observed_at
+        ) VALUES (?, ?, ?, ?)
+        """,
+        (
+            request.operation_id,
+            request_hash,
+            rejection_event_id,
+            occurred_at,
+        ),
+    )
+    return OperationOutcome(
+        status="rejected",
+        operation_id=request.operation_id,
+        admission_event_id=None,
+        rejection_event_id=rejection_event_id,
+        domain_event_ids=(),
+        revisions=(),
+        reason="operation_id_conflict",
+    )
+
+
+def _run_governed(
+    root: Path,
+    request: OperationRequest,
+    *,
+    validator: Callable[[_OperationValidationContext], GateRejection | None] | None,
+    projector: Callable[[_OperationContext], None],
+    clock: Callable[[], datetime] = utc_now,
+    fault_injector: Callable[[str], None] | None = None,
+) -> OperationOutcome:
+    """Run one database-only operation through the atomic admission kernel."""
+
+    expected, request_hash = _normalized_operation_request(request)
+    occurred_at = clock()
+    if occurred_at.tzinfo is None or occurred_at.utcoffset() is None:
+        raise InvalidOperation("operation clock must return a timezone-aware datetime")
+    occurred_at_text = occurred_at.isoformat(timespec="milliseconds")
+    db_path = Path(root).expanduser().resolve() / "aos.db"
+    database_identity = _validate_sqlite_source_files(db_path)
+    with sqlite3.connect(db_path) as db:
+        _require_database_path_identity(db_path, database_identity)
+        db.execute("PRAGMA foreign_keys=ON")
+        if _schema_version(db) != CURRENT_SCHEMA_VERSION:
+            raise InvalidOperation("journal schema requires explicit migration")
+        if db.execute("SELECT 1 FROM migration_cleanup WHERE status='pending' LIMIT 1").fetchone():
+            raise InvalidOperation("journal has pending migration cleanup")
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            existing = db.execute(
+                """
+                SELECT request_hash, status, outcome
+                FROM operations
+                WHERE operation_id=?
+                """,
+                (request.operation_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing[0]) == request_hash:
+                    outcome = _outcome_from_record(
+                        request.operation_id,
+                        str(existing[1]),
+                        str(existing[2]),
+                    )
+                    db.rollback()
+                    return outcome
+                outcome = _commit_operation_conflict(
+                    db,
+                    request=request,
+                    request_hash=request_hash,
+                    occurred_at=occurred_at_text,
+                )
+                db.commit()
+                return outcome
+
+            observed = _observed_revisions(db, expected)
+            rejection = (
+                GateRejection("secret_policy_rejected", {})
+                if _content_policy_reason(canonical_json_bytes(dict(request.payload))) is not None
+                else None
+            )
+            revision_rejection = next(
+                (
+                    GateRejection(
+                        "revision_mismatch",
+                        {
+                            "aggregate_id": item.aggregate_id,
+                            "aggregate_type": item.aggregate_type,
+                        },
+                    )
+                    for item in expected
+                    if observed[(item.aggregate_type, item.aggregate_id)] != item.revision
+                ),
+                None,
+            )
+            rejection = rejection or revision_rejection
+            authority_rejection, evaluated_expires_at = _authority_gate(
+                db,
+                request.invoker,
+                occurred_at,
+            )
+            rejection = rejection or authority_rejection
+            validation_context = _OperationValidationContext(
+                db=db,
+                request=request,
+                observed_revisions=observed,
+                occurred_at=occurred_at,
+            )
+            if rejection is None and validator is not None:
+                rejection = validator(validation_context)
+                if rejection is not None and not isinstance(rejection, GateRejection):
+                    raise JournalError("operation validator returned an invalid decision")
+            if rejection is not None:
+                outcome = _commit_new_rejection(
+                    db,
+                    request=request,
+                    request_hash=request_hash,
+                    expected=expected,
+                    observed=observed,
+                    rejection=rejection,
+                    occurred_at=occurred_at_text,
+                    evaluated_expires_at=evaluated_expires_at,
+                )
+                db.commit()
+                return outcome
+
+            admission_event_id = _append_raw_event(
+                db,
+                occurred_at=occurred_at_text,
+                kind="gate.admitted",
+                severity="info",
+                aggregate_type="operation",
+                aggregate_id=request.operation_id,
+                payload={
+                    "action": request.action,
+                    "targets": [
+                        {
+                            "aggregate_id": item.aggregate_id,
+                            "aggregate_type": item.aggregate_type,
+                            "expected_revision": item.revision,
+                            "role": item.role,
+                        }
+                        for item in expected
+                    ],
+                },
+            )
+            admitted = OperationOutcome(
+                status="admitted",
+                operation_id=request.operation_id,
+                admission_event_id=admission_event_id,
+                rejection_event_id=None,
+                domain_event_ids=(),
+                revisions=tuple(expected),
+            )
+            db.execute(
+                """
+                INSERT INTO operations(
+                    operation_id, action, request_hash, invoker_kind, invoker_id,
+                    authority_epoch_id, status, admission_event_id, outcome, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'admitted', ?, ?, ?)
+                """,
+                (
+                    request.operation_id,
+                    request.action,
+                    request_hash,
+                    request.invoker.kind,
+                    request.invoker.id,
+                    request.invoker.authority_epoch_id,
+                    admission_event_id,
+                    _outcome_payload(admitted),
+                    occurred_at_text,
+                ),
+            )
+            _insert_operation_targets(
+                db,
+                request.operation_id,
+                expected,
+                observed,
+            )
+            _insert_event_envelope(
+                db,
+                event_id=admission_event_id,
+                invoker_kind=request.invoker.kind,
+                invoker_id=request.invoker.id,
+                authority_epoch_id=request.invoker.authority_epoch_id,
+                evaluated_expires_at=evaluated_expires_at,
+                on_behalf_of=request.invoker.on_behalf_of,
+                decision_source_hash=request.invoker.decision_source_hash,
+                operation_id=request.operation_id,
+                request_hash=request_hash,
+                admission_id=None,
+            )
+            if fault_injector is not None:
+                fault_injector("after_admission")
+            context = _OperationContext(
+                db=db,
+                request=request,
+                request_hash=request_hash,
+                admission_event_id=admission_event_id,
+                occurred_at=occurred_at_text,
+                evaluated_expires_at=evaluated_expires_at,
+                expected_revisions=expected,
+                fault_injector=fault_injector,
+            )
+            projector(context)
+            if fault_injector is not None:
+                fault_injector("after_projection")
+            revisions = _result_revisions(db, expected)
+            completed_event_id = context.event_ids[-1] if context.event_ids else admission_event_id
+            outcome = OperationOutcome(
+                status="completed",
+                operation_id=request.operation_id,
+                admission_event_id=admission_event_id,
+                rejection_event_id=None,
+                domain_event_ids=context.event_ids,
+                revisions=revisions,
+            )
+            db.execute(
+                """
+                UPDATE operations
+                SET status='completed', completed_event_id=?, outcome=?, completed_at=?
+                WHERE operation_id=? AND status='admitted'
+                """,
+                (
+                    completed_event_id,
+                    _outcome_payload(outcome),
+                    occurred_at_text,
+                    request.operation_id,
+                ),
+            )
+            if db.execute("PRAGMA foreign_key_check").fetchall():
+                raise JournalError("operation introduced a foreign-key violation")
+            _require_database_path_identity(db_path, database_identity)
+        except Exception:
+            db.rollback()
+            raise
+        else:
+            db.commit()
+        _require_database_path_identity(db_path, database_identity)
+        _checkpoint_and_fsync_database(db, db_path, database_identity)
+    return outcome
+
+
+def append_observation(
+    root: Path,
+    request: OperationRequest,
+    *,
+    kind: str | None = None,
+    aggregate_type: str | None = None,
+    aggregate_id: str | None = None,
+    payload: Mapping[str, object] | None = None,
+    severity: str | None = None,
+    clock: Callable[[], datetime] = utc_now,
+) -> OperationOutcome:
+    """Append one attributable, idempotent, nonreserved observation."""
+
+    supplied = {
+        "aggregate_id": aggregate_id,
+        "aggregate_type": aggregate_type,
+        "kind": kind,
+        "payload": payload,
+        "severity": severity,
+    }
+    if all(value is None for value in supplied.values()):
+        observation = dict(request.payload)
+        kind = observation.get("kind")  # type: ignore[assignment]
+        aggregate_type = observation.get("aggregate_type")  # type: ignore[assignment]
+        aggregate_id = observation.get("aggregate_id")  # type: ignore[assignment]
+        payload = observation.get("payload")  # type: ignore[assignment]
+        severity = observation.get("severity", "info")  # type: ignore[assignment]
+    elif any(value is None for key, value in supplied.items() if key != "severity"):
+        raise InvalidOperation("observation fields must be supplied together")
+    if severity is None:
+        severity = "info"
+
+    def validator(_context: _OperationValidationContext) -> GateRejection | None:
+        if request.action != "journal.append_observation":
+            return GateRejection("observation_action_invalid", {})
+        if request.expected_revisions:
+            return GateRejection("observation_revisions_not_permitted", {})
+        try:
+            if not isinstance(kind, str):
+                raise InvalidOperation("observation kind must be text")
+            require_generic_event_kind(kind)
+            _required_public_identifier(aggregate_type, "aggregate_type")
+            _required_public_identifier(aggregate_id, "aggregate_id")
+            _required_event_severity(severity)
+            if not isinstance(payload, Mapping):
+                raise InvalidOperation("observation payload must be an object")
+        except (InvalidOperation, ProtocolViolation):
+            return GateRejection("observation_contract_rejected", {})
+        return None
+
+    def projector(context: _OperationContext) -> None:
+        if (
+            not isinstance(kind, str)
+            or not isinstance(aggregate_type, str)
+            or not isinstance(aggregate_id, str)
+            or not isinstance(payload, Mapping)
+            or not isinstance(severity, str)
+        ):
+            raise JournalError("admitted observation contract is incomplete")
+        context.append_observation(
+            kind,
+            aggregate_type,
+            aggregate_id,
+            payload,
+            severity=severity,
+        )
+
+    return _run_governed(
+        root,
+        request,
+        validator=validator,
+        projector=projector,
+        clock=clock,
+    )
+
+
+def read_events(root: Path, *, after_event_id: int = 0) -> tuple[EventRecord, ...]:
+    """Read ordered events without mutating or renewing authority."""
+
+    if type(after_event_id) is not int or after_event_id < 0:
+        raise InvalidOperation("after_event_id must be a nonnegative integer")
+    db_path = Path(root).expanduser().resolve() / "aos.db"
+    with _readonly_database_snapshot(db_path) as db:
+        if _schema_version(db) != CURRENT_SCHEMA_VERSION:
+            raise InvalidOperation("journal schema requires explicit migration")
+        rows = db.execute(
+            """
+            SELECT
+                e.id, e.occurred_at, e.kind, e.severity,
+                e.aggregate_type, e.aggregate_id, e.payload,
+                envelope.envelope_version,
+                envelope.payload_schema_version,
+                envelope.invoker_kind,
+                envelope.invoker_id,
+                envelope.authority_epoch_id,
+                envelope.evaluated_expires_at,
+                envelope.on_behalf_of,
+                envelope.decision_source_hash,
+                envelope.operation_id,
+                envelope.request_key,
+                envelope.request_hash,
+                envelope.causation_id,
+                envelope.admission_id
+            FROM events AS e
+            LEFT JOIN event_envelopes AS envelope ON envelope.event_id=e.id
+            WHERE e.id > ?
+            ORDER BY e.id
+            """,
+            (after_event_id,),
+        ).fetchall()
+    records: list[EventRecord] = []
+    envelope_fields = (
+        "envelope_version",
+        "payload_schema_version",
+        "invoker_kind",
+        "invoker_id",
+        "authority_epoch_id",
+        "evaluated_expires_at",
+        "on_behalf_of",
+        "decision_source_hash",
+        "operation_id",
+        "request_key",
+        "request_hash",
+        "causation_id",
+        "admission_id",
+    )
+    for row in rows:
+        try:
+            payload = json.loads(str(row[6]))
+        except json.JSONDecodeError as exc:
+            raise JournalError("event payload is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise JournalError("event payload is not a JSON object")
+        envelope = None if row[7] is None else dict(zip(envelope_fields, row[7:], strict=True))
+        records.append(
+            EventRecord(
+                event_id=int(row[0]),
+                occurred_at=str(row[1]),
+                kind=str(row[2]),
+                severity=str(row[3]),
+                aggregate_type=str(row[4]),
+                aggregate_id=str(row[5]),
+                payload=payload,
+                envelope=envelope,
+            )
+        )
+    return tuple(records)

@@ -177,7 +177,7 @@ def seed_populated_schema_v1(db_path: Path) -> None:
         )
 
 
-def test_migrate_actual_schema_v1_preserves_history_and_adds_boundary(
+def test_migrate_actual_schema_v1_preserves_history_and_adds_admission_and_boundary(
     tmp_path: Path,
 ) -> None:
     source = FIXTURES / "schema-v1"
@@ -209,7 +209,11 @@ def test_migrate_actual_schema_v1_preserves_history_and_adds_boundary(
 
     migrated_events = read_legacy_events(db_path)
     assert migrated_events[: len(legacy_events)] == legacy_events
-    assert len(migrated_events) == len(legacy_events) + 1
+    assert len(migrated_events) == len(legacy_events) + 2
+    admission = migrated_events[-2]
+    assert admission[0] == outcome.boundary_event_id - 1
+    assert admission[1] == FIXED_TIME.isoformat(timespec="milliseconds")
+    assert admission[2] == "gate.admitted"
     boundary = migrated_events[-1]
     assert boundary[0] == outcome.boundary_event_id
     assert boundary[1] == FIXED_TIME.isoformat(timespec="milliseconds")

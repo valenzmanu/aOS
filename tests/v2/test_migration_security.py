@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from modules.journal import (
+    CURRENT_SCHEMA_VERSION,
     JournalError,
     MigrationRejected,
     MigrationRequest,
@@ -682,7 +683,7 @@ def test_inspection_is_portable_but_fails_when_canonical_cas_is_incomplete(
     moved_root = tmp_path / "moved-state"
     shutil.copytree(root, moved_root)
 
-    assert inspect_journal(moved_root).schema_version == 3
+    assert inspect_journal(moved_root).schema_version == CURRENT_SCHEMA_VERSION
 
     snapshot = (
         moved_root / "blobs" / "sha256" / outcome.snapshot_digest[:2] / outcome.snapshot_digest

@@ -1,0 +1,69 @@
+{
+  "database": {
+    "event_count": 20,
+    "event_high_water": 20,
+    "path": "aos.db",
+    "schema_version": 3,
+    "sha256": "da31527b9b2299b295a3372a572736fa0a1c298d261dba1179ee565f4e8436c3",
+    "size": 204800,
+    "structural_fingerprint_sha256": "9dbb2c3b35f0f43ff1fd50339aceb98b7eced27b90a118c81b23df7ba9b685dd"
+  },
+  "files": [
+    {
+      "path": "aos.db",
+      "sha256": "da31527b9b2299b295a3372a572736fa0a1c298d261dba1179ee565f4e8436c3",
+      "size": 204800
+    },
+    {
+      "path": "artifacts/P-E26D600C.jsonl",
+      "sha256": "08786b0c38fdfffb40f065d884661cb061042c40d8fc5a7a5c003992626709c0",
+      "size": 136
+    },
+    {
+      "path": "blobs/sha256/08/08786b0c38fdfffb40f065d884661cb061042c40d8fc5a7a5c003992626709c0",
+      "sha256": "08786b0c38fdfffb40f065d884661cb061042c40d8fc5a7a5c003992626709c0",
+      "size": 136
+    },
+    {
+      "path": "blobs/sha256/4c/4ca9792b87baa1bc1e9294beb147346c95b19343e989bc5ebf0ad65ccd24bc3e",
+      "sha256": "4ca9792b87baa1bc1e9294beb147346c95b19343e989bc5ebf0ad65ccd24bc3e",
+      "size": 4108
+    },
+    {
+      "path": "legacy-backup.sqlite3",
+      "sha256": "48bcac8b268af99b34f5b2f17e6ee3942e80264286210ba61c94126afe7d0374",
+      "size": 131072
+    }
+  ],
+  "fixture": "schema-v3",
+  "manifest_version": 1,
+  "migration": {
+    "backup_digest": "48bcac8b268af99b34f5b2f17e6ee3942e80264286210ba61c94126afe7d0374",
+    "boundary_event_id": 14,
+    "final_event_id": 20,
+    "invoker_id": "maintenance:fingerprint",
+    "legacy_high_water_event_id": 13,
+    "occurred_at": "2026-07-23T12:00:00.000+00:00",
+    "operation_id": "OP-STRUCTURE-V3",
+    "request_hash": "7073944d980f2312e142679a6708361c6ac67d882f7fe1c64e65d2a10296643e",
+    "snapshot_digest": "4ca9792b87baa1bc1e9294beb147346c95b19343e989bc5ebf0ad65ccd24bc3e",
+    "source_schema": 2,
+    "target_schema": 3
+  },
+  "rollback_backup": {
+    "event_count": 13,
+    "event_high_water": 13,
+    "path": "legacy-backup.sqlite3",
+    "schema_version": 2,
+    "sha256": "48bcac8b268af99b34f5b2f17e6ee3942e80264286210ba61c94126afe7d0374",
+    "size": 131072,
+    "structural_fingerprint_sha256": "abb082983ec5da9b65a33f107143a131ffdddc6570947dc5e85142b50a8064d2"
+  },
+  "source": {
+    "implementation_commit": "1582aa1fc5d070b63ffcad0b6e6689f04f1464bb",
+    "legacy_artifact_sha256": "08786b0c38fdfffb40f065d884661cb061042c40d8fc5a7a5c003992626709c0",
+    "legacy_database_sha256": "001ea8d9b3e1ca337f6c5a6b4eddd5aa481ed6f780950c8f695648de59664a61",
+    "legacy_fixture": "tests/legacy/fixtures/schema-v2",
+    "legacy_fixture_commit": "e920ff23654c16204c7f7547d4ca7952d52c29bd"
+  }
+}
