@@ -1,4 +1,0 @@
-# aOS implementation mode: the 0.1 cooperative guardrail (multi_agent = false) is lifted so
-# implementor agents can use normal harness capabilities during the v2 rebuild.
-# The delegation boundary returns as distro intent at milestone M3
-# (see docs/aos-v2-implementation-plan.md).

@@ -1,12 +1,18 @@
 ---
 title: aOS 2.0 implementation plan — SCAOS substrate
-status: implementation in progress; M0 complete; M1 active
+status: v0 foundation established; legacy source cut over; remaining milestones active
 decision: docs/adr/0002-sparse-constitutional-agent-os.md
-predecessor: docs/aos-poc-plan.md (0.1; goals retained, substrate replaced)
+predecessor: historical 0.1 plan at e920ff2:docs/aos-poc-plan.md
 harbor_baseline: 0.20.0; task schema 1.3
 ---
 
 # aOS 2.0 implementation plan
+
+> **Cutover status (2026-07-23):** the superseded `aos/` source runtime, old console entrypoints,
+> provider adapters, dashboard, demo, and editor launch surfaces have been removed by explicit
+> product decision. Historical source remains in Git, and deterministic schema fixtures remain as
+> migration evidence. References below to the 0.1 runtime are historical requirements or migration
+> criteria; they do not describe an available repository surface.
 
 Read ADR 0002 first. It contains the architectural decision; this file fixes the implementation
 contracts, build order, and evidence required to claim each milestone. The measurement layer is

@@ -3,14 +3,14 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "aos-control-plane"
-version = "0.1.0"
-description = "A harness-agnostic, durable control plane for coding agents"
+name = "aos-agent-os"
+version = "0.2.0"
+description = "A sparse constitutional substrate for agent-run missions"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Manuel Valenzuela" }]
-keywords = ["agents", "codex", "cursor", "orchestration", "control-plane"]
+keywords = ["agents", "codex", "constitution", "journal", "state-tree"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: MIT License",
@@ -22,12 +22,9 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-cursor = ["cursor-sdk>=0.1.6,<0.2"]
 dev = ["pytest>=8.3", "ruff>=0.11"]
 
 [project.scripts]
-aos = "aos.cli:main"
-aosd = "aos.daemon:main"
 aos-v0 = "modules.v0_tracer:main"
 
 [project.urls]
@@ -35,7 +32,7 @@ Homepage = "https://github.com/valenzmanu/aOS"
 Issues = "https://github.com/valenzmanu/aOS/issues"
 
 [tool.hatch.build.targets.wheel]
-packages = ["aos", "modules"]
+packages = ["modules"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
