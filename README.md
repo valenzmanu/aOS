@@ -1,7 +1,8 @@
 # aOS — an operating substrate for coding agents
 
-aOS keeps durable mission truth outside any individual agent conversation while leaving reasoning
-and execution to the agents themselves.
+aOS helps one human direct a workforce of agents without micromanaging every session. It keeps
+durable mission truth outside any individual agent conversation while leaving reasoning and
+execution to the agents themselves.
 
 Agents navigate a State Tree and follow versioned distro instructions. A small constitutional
 kernel admits or rejects contested changes, records authority, binds verifier evidence, and
@@ -26,10 +27,14 @@ requires explicit human decisions. It does not decide what work to do or orchest
 
 The architectural decision is [ADR 0002](docs/adr/0002-sparse-constitutional-agent-os.md). The
 remaining build sequence and assurance claims are in the
-[v2 implementation plan](docs/aos-v2-implementation-plan.md). aOS preserves durable mission work in
-the journal and State Tree; it does not replace harness memory. Build priority is mission controls,
-then readable project state, then proving a new agent can continue from saved state, then real
-workers.
+[implementation plan](docs/aos-v2-implementation-plan.md). aOS preserves durable mission work in
+the journal and State Tree; it does not replace harness memory.
+
+`E2E-RECOVERY-01` proves the constitutional recovery joint with a fresh agent: one atomic
+operation orphans the stalled session, closes its authority, resets the same process from
+`running` to `created`, and binds a fresh session and authority epoch. The attempt, process, work
+order, worktree, and partial work remain in place. Agents still diagnose the stall and decide
+whether to recover; aOS adds no monitor or orchestration loop.
 
 ## Proven foundation
 
@@ -52,16 +57,18 @@ Run it with an authenticated Codex CLI:
 ```bash
 uv sync --extra dev
 uv run python evals/v0/run.py
+uv run python evals/recovery/run.py
 ```
 
 The current tracer is deliberately narrow: one mission, one deterministic worker fixture, and two
-scripted human decisions. Real worker adapters, retries, reconstruction, multi-mission operation,
+scripted human decisions. Generic verification, real worker adapters, multi-mission operation,
 and the general distro remain later milestones.
 
 ## Repository
 
 ```text
 modules/       deterministic constitutional joints
+evals/recovery/ agent-driven stalled-worker recovery proof
 evals/v0/      permanent agent-runtime vertical tracer
 tests/v2/      governance, protocol, migration, and tracer tests
 docs/          architecture decision and implementation plan

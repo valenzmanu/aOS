@@ -23,6 +23,6 @@ loops, schedulers, or provider-specific orchestration.
 ## Pull requests
 
 Keep changes focused, explain the authority or durability invariant being changed, include tests,
-and update user-facing documentation. Changes to the distro or State Tree must preserve explicit
-liaison activation and the read-only grader boundary. By contributing, you agree that your
-contribution is licensed under the MIT License.
+and update user-facing documentation. Changes to the distro or State Tree must preserve resident,
+non-exclusive liaison behavior and the read-only grader seam. By contributing, you agree that
+your contribution is licensed under the MIT License.

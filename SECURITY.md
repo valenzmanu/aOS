@@ -6,7 +6,7 @@ agent harness from bypassing project instructions.
 
 ## Supported versions
 
-Only the latest release on the default branch receives security fixes during the PoC phase.
+Only the latest release on the default branch receives security fixes during the alpha.
 
 ## Report a vulnerability
 
@@ -28,12 +28,14 @@ all real tokens and private repository content from examples.
 - external repository worktrees and uncommitted code
 - local usernames, absolute paths, process IDs, and provider session identifiers
 
-Do not attach those directories to bug reports. Produce a minimal reproduction using the fake
-driver and synthetic data. Run `uv run python scripts/check_public_tree.py` before publishing.
+Do not attach those directories to bug reports. Produce a minimal reproduction using synthetic
+data and the deterministic worker fixture. Run `uv run python scripts/check_public_tree.py` before
+publishing.
 
 ## Threat-model limits
 
-- Liaison and process tokens are bearer credentials. Protect the environment of active processes.
+- Worker and process capabilities are bearer credentials. Protect the environment of active
+  processes. Resident liaison session IDs are attribution, not credentials.
 - Distro instructions and agent-role boundaries are cooperative, not hard enforcement.
 - Agent harnesses may send objectives, work orders, and repository content to their configured
   model providers under those providers' terms and account settings.

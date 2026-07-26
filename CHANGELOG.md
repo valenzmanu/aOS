@@ -13,10 +13,16 @@ initial alpha series.
 - retained scoped, expiring capability epochs only for delegated worker/process authority
 - added replay-safe retirement of historical liaison epochs and concurrency/orphan-tolerance tests
 - cut the permanent `E2E-00` tracer over from liaison tokens and claims to authored session records
-- reframed the v2 roadmap in plain aOS language: mission controls, readable project state,
-  new-agent continuation, and real workers (stable milestone IDs retained in parentheses)
-- added landing-page learning mission and thin `aos-mission` controls
-  (intake → evaluable contract → authorize) driven by vague human requests
+- reduced the required-read implementation plan to the active outcome, invariants, recovery proof,
+  and definition of done; completed and speculative machinery remains in Git history
+- added thin `aos-mission` controls learned from a disposable mission
+  (intake → evaluable contract → authorize → dispatch → start → finish)
+- removed the disposable landing-page output and mission dossier after preserving their reusable
+  authority, evidence, privacy, replay, and recovery lessons
+- removed the landing-specific HTML/brand verifier from constitutional code; a general evidence
+  interface must be justified by the recovery eval
+- made the default pytest command include the eval harness tests instead of maintaining a hidden
+  second test invocation
 
 ## 0.2.0 — 2026-07-23
 

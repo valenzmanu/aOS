@@ -1,12 +1,11 @@
-"""Learning-mission thin controls from intake through deterministic verification.
+"""Provisional mission controls learned from one disposable mission.
 
 Humans may speak vaguely. This module preserves the raw request, lets the liaison
 refine an evaluable contract in the State Tree (interviewing when needed), and
-admits authorization only when that contract is evaluable. It also gates the
-landing mission's dispatch/start/finish transitions and pinned acceptance
-evidence. It never launches, sequences, retries, or supervises a worker; agents
-remain the runtime. Behavior here is shaped by the landing-page learning mission
-under evals/learning/aos-landing/.
+admits authorization only when that contract is evaluable. It also gates worker
+authority, lifecycle transitions, and bound receipts. It never launches, sequences,
+supervises, or evaluates a worker; agents remain the runtime. Verification returns
+only after a general evidence interface earns its place.
 """
 
 from __future__ import annotations
@@ -17,11 +16,9 @@ import json
 import os
 import re
 import sqlite3
-import subprocess
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Protocol
 
@@ -45,9 +42,10 @@ from modules.protocol import (
     AggregateType,
     ContractAuthorization,
     MissionState,
+    ProcessRecovery,
     ProtocolViolation,
+    RetryKind,
     require_transition,
-    validate_evidence_record,
 )
 
 REQUIRED_CONTRACT_HEADINGS = (
@@ -61,27 +59,6 @@ UNCHECKED_ITEM = re.compile(r"^\s*[-*]\s+\[\s\]\s+", re.MULTILINE)
 CHECKED_ITEM = re.compile(r"^\s*[-*]\s+\[[xX]\]\s+", re.MULTILINE)
 HEADING_LINE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 WORKER_NOTE = re.compile(r"^\s*-\s+([A-Za-z-]+):\s*(.*?)\s*$", re.MULTILINE)
-LANDING_REPOSITORY_URL = "https://github.com/valenzmanu/aOS"
-LANDING_VERIFIER_SPEC = {
-    "checks": [
-        "single_static_page",
-        "primary_brand_aos",
-        "product_sentence",
-        "github_primary_cta",
-        "privacy_scan",
-        "worker_attempt_notes",
-    ],
-    "report_policy": "non-sensitive-aggregates-only",
-    "schema_version": 1,
-    "selectors": {
-        "primary_brand": "[data-primary-brand]",
-        "primary_cta": "a[data-primary-cta]",
-        "product_sentence": "[data-product-sentence]",
-    },
-    "symlink_policy": "reject",
-}
-LANDING_VERIFIER_SPEC_DIGEST = content_digest(LANDING_VERIFIER_SPEC)
-LANDING_COMMAND_DIGEST = hashlib.sha256(b"aos-mission verify:landing-v1").hexdigest()
 SECRET_SHAPED = re.compile(
     rb"(?i)(?:sk-[a-z0-9_-]{20,}|gh[pousr]_[a-z0-9]{20,}|bearer\s+[a-z0-9._~+/=-]{20,})"
 )
@@ -127,6 +104,26 @@ class _ProjectionContext(Protocol):
     ) -> object: ...
 
 
+@dataclass(frozen=True)
+class _WorkerMembrane:
+    attempt_id: str
+    attempt_number: int
+    attempt_state: str
+    authority_epoch_id: str
+    authority_expires_at: str
+    authority_status: str
+    backend: str
+    budget_seconds: int
+    model: str
+    process_id: str
+    process_state: str
+    session_id: str
+    session_sequence: int
+    session_state: str
+    work_order_id: str
+    workspace: str
+
+
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
@@ -147,342 +144,12 @@ def _json_file(path: Path) -> dict[str, object]:
     return payload
 
 
-class _LandingParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self._captures: list[tuple[str, str]] = []
-        self.brand_text: list[str] = []
-        self.product_text: list[str] = []
-        self.primary_cta_hrefs: list[str] = []
-
-    def handle_starttag(
-        self,
-        tag: str,
-        attrs: list[tuple[str, str | None]],
-    ) -> None:
-        attributes = dict(attrs)
-        if "data-primary-brand" in attributes:
-            self._captures.append((tag, "brand"))
-        if "data-product-sentence" in attributes:
-            self._captures.append((tag, "product"))
-        if tag == "a" and "data-primary-cta" in attributes:
-            self.primary_cta_hrefs.append(attributes.get("href") or "")
-
-    def handle_endtag(self, tag: str) -> None:
-        for index in range(len(self._captures) - 1, -1, -1):
-            if self._captures[index][0] == tag:
-                self._captures.pop(index)
-                break
-
-    def handle_data(self, data: str) -> None:
-        for _tag, capture in self._captures:
-            if capture == "brand":
-                self.brand_text.append(data)
-            elif capture == "product":
-                self.product_text.append(data)
-
-
-def _normalized_text(parts: list[str]) -> str:
-    return " ".join("".join(parts).split())
-
-
 def _contains_unsafe_content(payload: bytes) -> bool:
     lowered = payload.lower()
     return (
         SECRET_SHAPED.search(payload) is not None
         or SECRET_ASSIGNMENT.search(payload) is not None
         or any(marker.lower() in lowered for marker in PRIVATE_PATH_MARKERS)
-    )
-
-
-def _site_manifest(
-    site_root: Path,
-) -> tuple[Path, list[dict[str, object]], str]:
-    site_root = Path(site_root)
-    if site_root.is_symlink():
-        raise InvalidOperation("landing site root must not be a symlink")
-    site_root = site_root.resolve()
-    if not site_root.is_dir():
-        raise InvalidOperation("landing site root is missing")
-    entries: list[dict[str, object]] = []
-    for path in sorted(site_root.rglob("*")):
-        relative = path.relative_to(site_root).as_posix()
-        if path.is_symlink():
-            # Symlinks are rejected by the privacy check below. Never resolve or
-            # record their targets: a target can itself be a private host path.
-            entries.append({"path": relative, "type": "symlink"})
-        elif path.is_file():
-            entries.append(
-                {
-                    "digest": _sha256_bytes(path.read_bytes()),
-                    "mode": path.stat().st_mode & 0o777,
-                    "path": relative,
-                    "size": path.stat().st_size,
-                    "type": "file",
-                }
-            )
-        elif path.is_dir():
-            entries.append({"path": relative, "type": "directory"})
-    return site_root, entries, content_digest(entries)
-
-
-def _git_metadata(site_root: Path, manifest_digest: str) -> tuple[str, str]:
-    site_root = Path(site_root).resolve()
-    git_root = next(
-        (candidate for candidate in (site_root, *site_root.parents) if (candidate / ".git").exists()),
-        None,
-    )
-    if git_root is None:
-        return "0" * 40, manifest_digest
-    environment = {
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "LC_ALL": "C",
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-    }
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=git_root,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    git_head = head.stdout.strip()
-    if head.returncode != 0 or re.fullmatch(r"[0-9a-f]{40}", git_head) is None:
-        raise InvalidOperation("could not identify landing-site Git HEAD")
-    relative = site_root.relative_to(git_root).as_posix()
-    index = subprocess.run(
-        ["git", "ls-files", "--stage", "--", relative],
-        cwd=git_root,
-        env=environment,
-        check=False,
-        capture_output=True,
-    )
-    if index.returncode != 0:
-        raise InvalidOperation("could not identify landing-site Git index")
-    return git_head, _sha256_bytes(index.stdout)
-
-
-def _landing_acceptance_report(
-    site_root: Path,
-    notes_path: Path,
-    *,
-    mission_id: str,
-) -> tuple[dict[str, object], str, str, str]:
-    site_root, manifest, manifest_digest = _site_manifest(site_root)
-    symlink_paths = sorted(
-        str(entry["path"]) for entry in manifest if entry["type"] == "symlink"
-    )
-    html_files = sorted(
-        entry["path"]
-        for entry in manifest
-        if entry["type"] == "file" and str(entry["path"]).endswith(".html")
-    )
-    build_manifests = {
-        "package.json",
-        "vite.config.js",
-        "vite.config.ts",
-        "webpack.config.js",
-    }
-    present_build_manifests = sorted(
-        item for item in build_manifests if (site_root / item).exists()
-    )
-    index_path = site_root / "index.html"
-    index_is_regular = any(
-        entry["type"] == "file" and entry["path"] == "index.html"
-        for entry in manifest
-    )
-    index_text = (
-        index_path.read_text(encoding="utf-8") if index_is_regular else ""
-    )
-    parser = _LandingParser()
-    parser.feed(index_text)
-    brand_text = _normalized_text(parser.brand_text)
-    product_text = _normalized_text(parser.product_text)
-
-    unsafe_files: list[str] = []
-    legacy_brand_files: list[str] = []
-    for entry in manifest:
-        if entry["type"] != "file":
-            continue
-        relative = str(entry["path"])
-        payload = (site_root / relative).read_bytes()
-        if _contains_unsafe_content(payload):
-            unsafe_files.append(relative)
-        if b"tyr" in payload.lower():
-            legacy_brand_files.append(relative)
-
-    notes_text = (
-        Path(notes_path).read_text(encoding="utf-8")
-        if Path(notes_path).is_file()
-        else ""
-    )
-    notes = {key: value for key, value in WORKER_NOTE.findall(notes_text)}
-    try:
-        elapsed_seconds = int(notes.get("Elapsed-seconds", ""))
-    except ValueError:
-        elapsed_seconds = -1
-
-    checks = [
-        {
-            "details": {
-                "build_manifest_count": len(present_build_manifests),
-                "has_index_html": "index.html" in html_files,
-                "html_file_count": len(html_files),
-            },
-            "name": "single_static_page",
-            "passed": html_files == ["index.html"] and not present_build_manifests,
-        },
-        {
-            "details": {
-                "legacy_brand_file_count": len(legacy_brand_files),
-                "primary_brand_matches": brand_text == "aOS",
-            },
-            "name": "primary_brand_aos",
-            "passed": brand_text == "aOS" and not legacy_brand_files,
-        },
-        {
-            "details": {
-                "length": len(product_text),
-                "mentions_aos": "aos" in product_text.lower(),
-            },
-            "name": "product_sentence",
-            "passed": (
-                20 <= len(product_text) <= 220
-                and product_text[-1:] in {".", "!", "?"}
-            ),
-        },
-        {
-            "details": {
-                "primary_cta_count": len(parser.primary_cta_hrefs),
-                "primary_cta_matches_repository": (
-                    parser.primary_cta_hrefs == [LANDING_REPOSITORY_URL]
-                ),
-            },
-            "name": "github_primary_cta",
-            "passed": parser.primary_cta_hrefs == [LANDING_REPOSITORY_URL],
-        },
-        {
-            "details": {
-                "symlink_count": len(symlink_paths),
-                "unsafe_file_count": len(unsafe_files),
-            },
-            "name": "privacy_scan",
-            "passed": not unsafe_files and not symlink_paths,
-        },
-        {
-            "details": {
-                "elapsed_seconds": elapsed_seconds,
-                "harness_recorded": bool(notes.get("Harness")),
-                "model_recorded": bool(notes.get("Model")),
-            },
-            "name": "worker_attempt_notes",
-            "passed": (
-                bool(notes.get("Harness"))
-                and bool(notes.get("Model"))
-                and elapsed_seconds >= 0
-            ),
-        },
-    ]
-    report = {
-        "checks": checks,
-        "mission_id": mission_id,
-        "passed": all(bool(check["passed"]) for check in checks),
-        "schema_version": 1,
-        "site_manifest_digest": manifest_digest,
-        "verifier_spec_digest": LANDING_VERIFIER_SPEC_DIGEST,
-    }
-    report_digest = content_digest(report)
-    git_head, index_digest = _git_metadata(site_root, manifest_digest)
-    return report, report_digest, git_head, index_digest
-
-
-def _recorded_verification_replay(
-    root: Path,
-    *,
-    operation_id: str,
-    mission_id: str,
-    expected_revision: int,
-    evidence_id: str,
-) -> tuple[OperationOutcome, dict[str, object], str, str] | None:
-    """Load a completed verify result without consulting mutable site files."""
-
-    db_path = Path(root).resolve() / "aos.db"
-    with sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True) as db:
-        row = db.execute(
-            """
-            SELECT operation.status, operation.outcome, event.payload
-            FROM operations AS operation
-            JOIN operation_targets AS target
-              ON target.operation_id=operation.operation_id
-             AND target.aggregate_type='mission'
-             AND target.aggregate_id=?
-             AND target.expected_revision=?
-             AND target.role='write'
-            JOIN event_envelopes AS envelope
-              ON envelope.operation_id=operation.operation_id
-            JOIN events AS event
-              ON event.id=envelope.event_id
-             AND event.kind='evidence.recorded'
-            WHERE operation.operation_id=?
-              AND operation.action='mission_controls.verify'
-              AND operation.status='completed'
-            """,
-            (mission_id, expected_revision, operation_id),
-        ).fetchone()
-    if row is None:
-        return None
-    try:
-        event_payload = json.loads(str(row[2]))
-        report = event_payload["verification_report"]
-        report_digest = str(event_payload["report_digest"])
-    except (KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise InvalidOperation("recorded verification result is invalid") from exc
-    if (
-        not isinstance(event_payload, dict)
-        or not isinstance(report, dict)
-        or event_payload.get("evidence_id") != evidence_id
-        or report.get("mission_id") != mission_id
-        or report.get("verifier_spec_digest") != LANDING_VERIFIER_SPEC_DIGEST
-        or content_digest(report) != report_digest
-        or not isinstance(report.get("site_manifest_digest"), str)
-    ):
-        raise InvalidOperation("recorded verification result is invalid")
-    outcome = _outcome_from_record(operation_id, str(row[0]), str(row[1]))
-    return (
-        outcome,
-        report,
-        report_digest,
-        str(report["site_manifest_digest"]),
-    )
-
-
-def _write_verification_projection(
-    attempt_dir: Path,
-    *,
-    process_id: str,
-    evidence_id: str,
-    report: dict[str, object],
-    report_digest: str,
-    manifest_digest: str,
-) -> None:
-    evidence_dir = (
-        attempt_dir
-        / "processes"
-        / process_id
-        / "evidence"
-        / evidence_id
-    )
-    _write_json(evidence_dir / "verification.json", report)
-    _write_json(
-        evidence_dir / "evidence.json",
-        {
-            "evidence_id": evidence_id,
-            "report_digest": report_digest,
-            "site_manifest_digest": manifest_digest,
-            "verifier_spec_digest": LANDING_VERIFIER_SPEC_DIGEST,
-        },
     )
 
 
@@ -504,6 +171,112 @@ def _operation_was_completed(outcome: OperationOutcome) -> bool:
     return outcome.status == "completed" or (
         outcome.status == "replayed" and outcome.original_status == "completed"
     )
+
+
+def _recorded_liaison_replay(
+    root: Path,
+    *,
+    operation_id: str,
+    action: str,
+    mission_id: str,
+    expected_revision: int,
+    event_payload: dict[str, object] | None = None,
+) -> OperationOutcome | None:
+    """Return an exact recorded replay before mutable current state is reread."""
+
+    with sqlite3.connect(Path(root).resolve() / "aos.db") as db:
+        operation = db.execute(
+            """
+            SELECT action, status, outcome
+            FROM operations
+            WHERE operation_id=?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if operation is None or str(operation[0]) != action:
+            return None
+        target = db.execute(
+            """
+            SELECT expected_revision
+            FROM operation_targets
+            WHERE operation_id=? AND aggregate_type='mission' AND aggregate_id=?
+            """,
+            (operation_id, mission_id),
+        ).fetchone()
+        if target is None or int(target[0]) != expected_revision:
+            return None
+        if event_payload:
+            payloads = db.execute(
+                """
+                SELECT event.payload
+                FROM events AS event
+                JOIN event_envelopes AS envelope ON envelope.event_id=event.id
+                WHERE envelope.operation_id=?
+                """,
+                (operation_id,),
+            ).fetchall()
+            if not any(
+                all(json.loads(str(row[0])).get(key) == value for key, value in event_payload.items())
+                for row in payloads
+            ):
+                return None
+    return _outcome_from_record(operation_id, str(operation[1]), str(operation[2]))
+
+
+def _recorded_replacement_replay(
+    root: Path,
+    *,
+    operation_id: str,
+    mission_id: str,
+    expected_revision: int,
+    worker_token: str,
+    budget_seconds: int,
+) -> OperationOutcome | None:
+    replay = _recorded_liaison_replay(
+        root,
+        operation_id=operation_id,
+        action="mission_controls.replace_worker",
+        mission_id=mission_id,
+        expected_revision=expected_revision,
+    )
+    if replay is None or replay.original_status != "completed":
+        return replay
+    with sqlite3.connect(Path(root).resolve() / "aos.db") as db:
+        epoch = db.execute(
+            """
+            SELECT authority.subject_id, authority.scope, authority.token_hash
+            FROM authority_epochs AS authority
+            JOIN event_envelopes AS envelope
+              ON envelope.event_id=authority.issued_event_id
+            WHERE envelope.operation_id=? AND authority.kind='worker'
+            """,
+            (operation_id,),
+        ).fetchone()
+        session = db.execute(
+            """
+            SELECT session.metadata
+            FROM worker_sessions AS session
+            JOIN events AS event
+              ON event.aggregate_type='worker_session'
+             AND event.aggregate_id=session.id
+             AND event.kind='worker_session.created'
+            JOIN event_envelopes AS envelope ON envelope.event_id=event.id
+            WHERE envelope.operation_id=?
+            """,
+            (operation_id,),
+        ).fetchone()
+    if epoch is None or session is None:
+        return None
+    metadata = json.loads(str(session[0]))
+    supplied_hash = capability_digest(
+        worker_token,
+        kind="worker",
+        subject_id=str(epoch[0]),
+        scope=str(epoch[1]),
+    )
+    if supplied_hash != str(epoch[2]) or metadata.get("budget_seconds") != budget_seconds:
+        return None
+    return replay
 
 
 def _section_body(markdown: str, heading: str) -> str | None:
@@ -575,6 +348,91 @@ def _mission_revision(root: Path, mission_id: str) -> int | None:
             (mission_id,),
         ).fetchone()
     return None if row is None else int(row[0])
+
+
+def _aggregate_revision(root: Path, aggregate_type: str, aggregate_id: str) -> int:
+    with sqlite3.connect(Path(root).resolve() / "aos.db") as db:
+        row = db.execute(
+            """
+            SELECT revision FROM aggregate_revisions
+            WHERE aggregate_type=? AND aggregate_id=?
+            """,
+            (aggregate_type, aggregate_id),
+        ).fetchone()
+    if row is None:
+        raise InvalidOperation(f"{aggregate_type} {aggregate_id} is missing")
+    return int(row[0])
+
+
+def _current_worker_membrane(root: Path, mission_id: str) -> _WorkerMembrane:
+    with sqlite3.connect(Path(root).resolve() / "aos.db") as db:
+        processes = db.execute(
+            """
+            SELECT
+                process.id, process.attempt, process.state, process.backend,
+                process.model, process.worktree, process.session_id,
+                attempt.id, attempt.state
+            FROM processes AS process
+            JOIN attempts AS attempt
+              ON attempt.mission_id=process.mission_id
+             AND attempt.number=process.attempt
+            WHERE process.mission_id=?
+              AND process.state IN ('created', 'running')
+            ORDER BY process.created_at DESC, process.id DESC
+            LIMIT 2
+            """,
+            (mission_id,),
+        ).fetchall()
+        if len(processes) != 1:
+            raise InvalidOperation("mission must have exactly one current worker process")
+        process = processes[0]
+        session = db.execute(
+            """
+            SELECT state, metadata, sequence
+            FROM worker_sessions
+            WHERE id=? AND process_id=?
+            """,
+            (str(process[6]), str(process[0])),
+        ).fetchone()
+        epochs = db.execute(
+            """
+            SELECT epoch_id, status, expires_at
+            FROM authority_epochs
+            WHERE kind='worker' AND subject_id=? AND status='active'
+            """,
+            (str(process[0]),),
+        ).fetchall()
+        work_order = db.execute(
+            """
+            SELECT id
+            FROM work_orders
+            WHERE process_id=?
+            ORDER BY revision DESC
+            LIMIT 1
+            """,
+            (str(process[0]),),
+        ).fetchone()
+    if session is None or len(epochs) != 1 or work_order is None:
+        raise InvalidOperation("current worker membrane is incomplete")
+    metadata = json.loads(str(session[1]))
+    return _WorkerMembrane(
+        attempt_id=str(process[7]),
+        attempt_number=int(process[1]),
+        attempt_state=str(process[8]),
+        authority_epoch_id=str(epochs[0][0]),
+        authority_expires_at=str(epochs[0][2]),
+        authority_status=str(epochs[0][1]),
+        backend=str(process[3]),
+        budget_seconds=int(metadata["budget_seconds"]),
+        model=str(process[4]),
+        process_id=str(process[0]),
+        process_state=str(process[2]),
+        session_id=str(process[6]),
+        session_sequence=int(session[2]),
+        session_state=str(session[0]),
+        work_order_id=str(work_order[0]),
+        workspace=str(process[5]),
+    )
 
 
 def intake_mission(
@@ -1267,6 +1125,370 @@ def dispatch_mission(
     return outcome
 
 
+def replace_worker(
+    root: Path,
+    missions_root: Path,
+    mission_id: str,
+    *,
+    operation_id: str,
+    expected_revision: int,
+    liaison_session_id: str,
+    worker_token: str,
+    budget_seconds: int,
+    clock: Callable[[], datetime] = utc_now,
+) -> OperationOutcome:
+    """Rotate a stalled worker's session and authority without changing its work."""
+
+    if not isinstance(budget_seconds, int) or not 1 <= budget_seconds <= 86_400:
+        raise InvalidOperation("budget_seconds must be between 1 and 86400")
+    replay = _recorded_replacement_replay(
+        root,
+        operation_id=operation_id,
+        mission_id=mission_id,
+        expected_revision=expected_revision,
+        worker_token=worker_token,
+        budget_seconds=budget_seconds,
+    )
+    if replay is not None:
+        return replay
+
+    previous = _current_worker_membrane(root, mission_id)
+    with sqlite3.connect(Path(root).resolve() / "aos.db") as db:
+        next_sequence = int(
+            db.execute(
+                """
+                SELECT COALESCE(MAX(sequence), 0) + 1
+                FROM worker_sessions
+                WHERE process_id=?
+                """,
+                (previous.process_id,),
+            ).fetchone()[0]
+        )
+    worker_session_id = f"S-{mission_id}-{next_sequence:04d}"
+    authority_epoch_id = f"AE-{mission_id}-{next_sequence:04d}"
+    scope = (
+        f"mission:{mission_id}:attempt:{previous.attempt_id}:"
+        f"process:{previous.process_id}"
+    )
+    token_hash = capability_digest(
+        worker_token,
+        kind="worker",
+        subject_id=previous.process_id,
+        scope=scope,
+    )
+    expected_revisions = (
+        ExpectedRevision("mission", mission_id, expected_revision, role="read"),
+        ExpectedRevision(
+            "attempt",
+            previous.attempt_id,
+            _aggregate_revision(root, "attempt", previous.attempt_id),
+            role="read",
+        ),
+        ExpectedRevision(
+            "process",
+            previous.process_id,
+            _aggregate_revision(root, "process", previous.process_id),
+        ),
+        ExpectedRevision(
+            "work_order",
+            previous.work_order_id,
+            _aggregate_revision(root, "work_order", previous.work_order_id),
+            role="read",
+        ),
+        ExpectedRevision(
+            "worker_session",
+            previous.session_id,
+            _aggregate_revision(root, "worker_session", previous.session_id),
+        ),
+        ExpectedRevision(
+            "authority_epoch",
+            previous.authority_epoch_id,
+            _aggregate_revision(root, "authority_epoch", previous.authority_epoch_id),
+        ),
+        ExpectedRevision("worker_session", worker_session_id, 0),
+        ExpectedRevision("authority_epoch", authority_epoch_id, 0),
+    )
+    recovery = ProcessRecovery(
+        retry_kind=RetryKind.SESSION,
+        previous_authority_epoch_id=previous.authority_epoch_id,
+        new_authority_epoch_id=authority_epoch_id,
+        same_process=True,
+        same_attempt=True,
+        same_worktree=True,
+        creates_new_worker_session=True,
+    )
+
+    def validator(context: _ValidationContext) -> GateRejection | None:
+        mission = context.db.execute(
+            "SELECT state FROM missions WHERE id=?",
+            (mission_id,),
+        ).fetchone()
+        attempt = context.db.execute(
+            "SELECT state FROM attempts WHERE id=?",
+            (previous.attempt_id,),
+        ).fetchone()
+        process = context.db.execute(
+            "SELECT state, session_id FROM processes WHERE id=?",
+            (previous.process_id,),
+        ).fetchone()
+        session = context.db.execute(
+            "SELECT state FROM worker_sessions WHERE id=?",
+            (previous.session_id,),
+        ).fetchone()
+        epoch = context.db.execute(
+            "SELECT status FROM authority_epochs WHERE epoch_id=?",
+            (previous.authority_epoch_id,),
+        ).fetchone()
+        if None in (mission, attempt, process, session, epoch):
+            return GateRejection("worker_membrane_missing", {"mission_id": mission_id})
+        if budget_seconds > previous.budget_seconds:
+            return GateRejection(
+                "replacement_budget_expanded",
+                {
+                    "admitted_budget_seconds": previous.budget_seconds,
+                    "requested_budget_seconds": budget_seconds,
+                },
+            )
+        if (
+            str(mission[0]) != str(MissionState.IMPLEMENTING)
+            or str(attempt[0]) != "active"
+            or str(process[0]) != "running"
+            or str(process[1]) != previous.session_id
+            or str(session[0]) != "running"
+            or str(epoch[0]) != "active"
+        ):
+            return GateRejection(
+                "worker_membrane_not_replaceable",
+                {"mission_id": mission_id, "process_id": previous.process_id},
+            )
+        try:
+            require_transition(
+                AggregateType.WORKER_SESSION,
+                "running",
+                "orphaned",
+            )
+            require_transition(
+                AggregateType.PROCESS,
+                "running",
+                "created",
+                context=recovery,
+            )
+        except ProtocolViolation:
+            return GateRejection("protocol_rejected", {"phase": "replace_worker"})
+        return None
+
+    def projector(context: _ProjectionContext) -> None:
+        context.append_event(
+            "worker_session.transitioned",
+            "worker_session",
+            previous.session_id,
+            {
+                "from_state": "running",
+                "reason": "stalled_worker_replaced",
+                "replacement_session_id": worker_session_id,
+                "to_state": "orphaned",
+            },
+        )
+        context.db.execute(
+            """
+            UPDATE worker_sessions
+            SET state='orphaned', ended_at=?
+            WHERE id=?
+            """,
+            (context.occurred_at, previous.session_id),
+        )
+
+        expired = datetime.fromisoformat(
+            previous.authority_expires_at.replace("Z", "+00:00")
+        ) <= datetime.fromisoformat(context.occurred_at)
+        authority_status = "expired" if expired else "revoked"
+        authority_kind = "authority.expired" if expired else "authority.revoked"
+        closed = context.append_event(
+            authority_kind,
+            "authority_epoch",
+            previous.authority_epoch_id,
+            {
+                "epoch_id": previous.authority_epoch_id,
+                "reason": "stalled_worker_replaced",
+                "replacement_epoch_id": authority_epoch_id,
+                "subject_id": previous.process_id,
+            },
+        )
+        context.db.execute(
+            """
+            UPDATE authority_epochs
+            SET status=?, closed_at=?, closed_event_id=?, close_reason=?
+            WHERE epoch_id=?
+            """,
+            (
+                authority_status,
+                context.occurred_at,
+                closed.event_id,  # type: ignore[attr-defined]
+                "stalled_worker_replaced",
+                previous.authority_epoch_id,
+            ),
+        )
+
+        expires_at = (
+            datetime.fromisoformat(context.occurred_at)
+            + timedelta(seconds=budget_seconds)
+        ).isoformat()
+        claimed = context.append_event(
+            "authority.claimed",
+            "authority_epoch",
+            authority_epoch_id,
+            {
+                "epoch_id": authority_epoch_id,
+                "expires_at": expires_at,
+                "kind": "worker",
+                "scope": scope,
+                "subject_id": previous.process_id,
+            },
+        )
+        context.db.execute(
+            """
+            INSERT INTO authority_epochs(
+                epoch_id, kind, subject_id, scope, token_hash, issued_at,
+                expires_at, status, issued_event_id
+            ) VALUES (?, 'worker', ?, ?, ?, ?, ?, 'active', ?)
+            """,
+            (
+                authority_epoch_id,
+                previous.process_id,
+                scope,
+                token_hash,
+                context.occurred_at,
+                expires_at,
+                claimed.event_id,  # type: ignore[attr-defined]
+            ),
+        )
+        context.append_event(
+            "worker_session.created",
+            "worker_session",
+            worker_session_id,
+            {
+                "process_id": previous.process_id,
+                "replaces_session_id": previous.session_id,
+                "sequence": next_sequence,
+                "session_id": worker_session_id,
+            },
+        )
+        context.db.execute(
+            """
+            INSERT INTO worker_sessions(
+                id, process_id, sequence, state, backend_handle,
+                metadata, started_at, ended_at
+            ) VALUES (?, ?, ?, 'created', NULL, ?, ?, NULL)
+            """,
+            (
+                worker_session_id,
+                previous.process_id,
+                next_sequence,
+                json.dumps(
+                    {
+                        "backend": previous.backend,
+                        "budget_seconds": budget_seconds,
+                        "model": previous.model,
+                        "replaces_session_id": previous.session_id,
+                        "workspace": previous.workspace,
+                    },
+                    sort_keys=True,
+                ),
+                context.occurred_at,
+            ),
+        )
+        context.append_event(
+            "process.transitioned",
+            "process",
+            previous.process_id,
+            {
+                "from_state": "running",
+                "new_authority_epoch_id": authority_epoch_id,
+                "new_session_id": worker_session_id,
+                "previous_authority_epoch_id": previous.authority_epoch_id,
+                "reason": "session_recovery",
+                "to_state": "created",
+            },
+        )
+        context.db.execute(
+            """
+            UPDATE processes
+            SET state='created', session_id=?, token_hash=?,
+                token_expires_at=?, updated_at=?
+            WHERE id=?
+            """,
+            (
+                worker_session_id,
+                token_hash,
+                expires_at,
+                context.occurred_at,
+                previous.process_id,
+            ),
+        )
+
+    outcome = _liaison_operation(
+        root,
+        operation_id=operation_id,
+        action="mission_controls.replace_worker",
+        liaison_session_id=liaison_session_id,
+        expected_revisions=expected_revisions,
+        payload={
+            "budget_seconds": budget_seconds,
+            "mission_id": mission_id,
+            "new_authority_epoch_id": authority_epoch_id,
+            "new_session_id": worker_session_id,
+            "previous_authority_epoch_id": previous.authority_epoch_id,
+            "previous_session_id": previous.session_id,
+            "process_id": previous.process_id,
+            "token_hash": token_hash,
+        },
+        validator=validator,
+        projector=projector,
+        clock=clock,
+    )
+    if outcome.status == "completed":
+        attempt_dir = (
+            Path(missions_root).resolve()
+            / mission_id
+            / "attempts"
+            / f"{previous.attempt_number:04d}"
+        )
+        session_root = (
+            attempt_dir / "processes" / previous.process_id / "sessions"
+        )
+        _write_json(
+            session_root / previous.session_id / "session.json",
+            {
+                "process_id": previous.process_id,
+                "reason": "stalled_worker_replaced",
+                "replacement_session_id": worker_session_id,
+                "sequence": previous.session_sequence,
+                "state": "orphaned",
+                "worker_session_id": previous.session_id,
+            },
+        )
+        _write_json(
+            session_root / worker_session_id / "session.json",
+            {
+                "process_id": previous.process_id,
+                "replaces_session_id": previous.session_id,
+                "sequence": next_sequence,
+                "state": "created",
+                "worker_session_id": worker_session_id,
+            },
+        )
+        attempt_metadata_path = attempt_dir / "attempt.json"
+        attempt_metadata = _json_file(attempt_metadata_path)
+        attempt_metadata.update(
+            {
+                "authority_epoch_id": authority_epoch_id,
+                "recovery_count": int(attempt_metadata.get("recovery_count", 0)) + 1,
+                "worker_session_id": worker_session_id,
+            }
+        )
+        _write_json(attempt_metadata_path, attempt_metadata)
+    return outcome
+
 def start_mission(
     root: Path,
     missions_root: Path,
@@ -1277,89 +1499,144 @@ def start_mission(
     liaison_session_id: str,
     clock: Callable[[], datetime] = utc_now,
 ) -> OperationOutcome:
-    """Mark an admitted worker membrane running before external execution."""
+    """Mark the current admitted worker session running before external execution."""
 
-    process_id = f"P-{mission_id}-0001"
-    worker_session_id = f"S-{mission_id}-0001"
-    authority_epoch_id = f"AE-{mission_id}-0001"
+    replay = _recorded_liaison_replay(
+        root,
+        operation_id=operation_id,
+        action="mission_controls.start",
+        mission_id=mission_id,
+        expected_revision=expected_revision,
+    )
+    if replay is not None:
+        return replay
+    membrane = _current_worker_membrane(root, mission_id)
+    with sqlite3.connect(Path(root).resolve() / "aos.db") as db:
+        mission = db.execute(
+            "SELECT state FROM missions WHERE id=?",
+            (mission_id,),
+        ).fetchone()
+    if mission is None:
+        raise InvalidOperation(f"mission {mission_id} is missing")
+    mission_state = str(mission[0])
+    if mission_state not in {
+        str(MissionState.DISPATCHED),
+        str(MissionState.IMPLEMENTING),
+    }:
+        raise InvalidOperation("mission is not ready to start a worker")
+    initial_start = mission_state == str(MissionState.DISPATCHED)
     expected_revisions = (
-        ExpectedRevision("mission", mission_id, expected_revision),
-        ExpectedRevision("process", process_id, 1),
-        ExpectedRevision("worker_session", worker_session_id, 1),
-        ExpectedRevision("attempt", f"A-{mission_id}-0001", 1, role="read"),
-        ExpectedRevision("work_order", f"WO-{mission_id}-0001", 1, role="read"),
-        ExpectedRevision("authority_epoch", authority_epoch_id, 1, role="read"),
+        ExpectedRevision(
+            "mission",
+            mission_id,
+            expected_revision,
+            role="write" if initial_start else "read",
+        ),
+        ExpectedRevision(
+            "process",
+            membrane.process_id,
+            _aggregate_revision(root, "process", membrane.process_id),
+        ),
+        ExpectedRevision(
+            "worker_session",
+            membrane.session_id,
+            _aggregate_revision(root, "worker_session", membrane.session_id),
+        ),
+        ExpectedRevision(
+            "attempt",
+            membrane.attempt_id,
+            _aggregate_revision(root, "attempt", membrane.attempt_id),
+            role="read",
+        ),
+        ExpectedRevision(
+            "work_order",
+            membrane.work_order_id,
+            _aggregate_revision(root, "work_order", membrane.work_order_id),
+            role="read",
+        ),
+        ExpectedRevision(
+            "authority_epoch",
+            membrane.authority_epoch_id,
+            _aggregate_revision(root, "authority_epoch", membrane.authority_epoch_id),
+            role="read",
+        ),
     )
 
     def validator(context: _ValidationContext) -> GateRejection | None:
-        rejection = _mission_state_rejection(
-            context,
-            mission_id=mission_id,
-            source=MissionState.DISPATCHED,
-            target=MissionState.IMPLEMENTING,
-        )
-        if rejection is not None:
-            return rejection
+        observed_mission = context.db.execute(
+            "SELECT state FROM missions WHERE id=?",
+            (mission_id,),
+        ).fetchone()
+        if observed_mission is None or str(observed_mission[0]) != mission_state:
+            return GateRejection(
+                "mission_state_mismatch",
+                {
+                    "expected": mission_state,
+                    "mission_id": mission_id,
+                    "observed": None if observed_mission is None else str(observed_mission[0]),
+                },
+            )
+        if initial_start:
+            rejection = _mission_state_rejection(
+                context,
+                mission_id=mission_id,
+                source=MissionState.DISPATCHED,
+                target=MissionState.IMPLEMENTING,
+            )
+            if rejection is not None:
+                return rejection
         process = context.db.execute(
-            "SELECT state FROM processes WHERE id=?",
-            (process_id,),
+            "SELECT state, session_id FROM processes WHERE id=?",
+            (membrane.process_id,),
         ).fetchone()
         session = context.db.execute(
             "SELECT state FROM worker_sessions WHERE id=?",
-            (worker_session_id,),
+            (membrane.session_id,),
         ).fetchone()
         epoch = context.db.execute(
             "SELECT status, expires_at FROM authority_epochs WHERE epoch_id=?",
-            (authority_epoch_id,),
+            (membrane.authority_epoch_id,),
         ).fetchone()
         if process is None or session is None or epoch is None:
-            return GateRejection(
-                "worker_membrane_missing",
-                {"mission_id": mission_id},
-            )
+            return GateRejection("worker_membrane_missing", {"mission_id": mission_id})
+        if str(process[1]) != membrane.session_id:
+            return GateRejection("worker_membrane_changed", {"mission_id": mission_id})
         if str(epoch[0]) != "active":
             return GateRejection(
                 "worker_authority_inactive",
-                {"authority_epoch_id": authority_epoch_id},
+                {"authority_epoch_id": membrane.authority_epoch_id},
             )
         if datetime.fromisoformat(str(epoch[1])) <= context.occurred_at:
             return GateRejection(
                 "worker_authority_expired",
-                {"authority_epoch_id": authority_epoch_id},
+                {"authority_epoch_id": membrane.authority_epoch_id},
             )
         try:
-            require_transition(
-                AggregateType.PROCESS,
-                str(process[0]),
-                "running",
-            )
+            require_transition(AggregateType.PROCESS, str(process[0]), "running")
             require_transition(
                 AggregateType.WORKER_SESSION,
                 str(session[0]),
                 "running",
             )
         except ProtocolViolation:
-            return GateRejection(
-                "protocol_rejected",
-                {"phase": "start"},
-            )
+            return GateRejection("protocol_rejected", {"phase": "start"})
         return None
 
     def projector(context: _ProjectionContext) -> None:
         context.append_event(
             "process.transitioned",
             "process",
-            process_id,
+            membrane.process_id,
             {"from_state": "created", "to_state": "running"},
         )
         context.db.execute(
             "UPDATE processes SET state='running', updated_at=? WHERE id=?",
-            (context.occurred_at, process_id),
+            (context.occurred_at, membrane.process_id),
         )
         context.append_event(
             "worker_session.transitioned",
             "worker_session",
-            worker_session_id,
+            membrane.session_id,
             {"from_state": "created", "to_state": "running"},
         )
         context.db.execute(
@@ -1368,18 +1645,19 @@ def start_mission(
             SET state='running', started_at=?
             WHERE id=?
             """,
-            (context.occurred_at, worker_session_id),
+            (context.occurred_at, membrane.session_id),
         )
-        context.append_event(
-            "mission.transitioned",
-            "mission",
-            mission_id,
-            {"from_state": "dispatched", "to_state": "implementing"},
-        )
-        context.db.execute(
-            "UPDATE missions SET state='implementing', updated_at=? WHERE id=?",
-            (context.occurred_at, mission_id),
-        )
+        if initial_start:
+            context.append_event(
+                "mission.transitioned",
+                "mission",
+                mission_id,
+                {"from_state": "dispatched", "to_state": "implementing"},
+            )
+            context.db.execute(
+                "UPDATE missions SET state='implementing', updated_at=? WHERE id=?",
+                (context.occurred_at, mission_id),
+            )
 
     outcome = _liaison_operation(
         root,
@@ -1388,35 +1666,34 @@ def start_mission(
         liaison_session_id=liaison_session_id,
         expected_revisions=expected_revisions,
         payload={
-            "authority_epoch_id": authority_epoch_id,
+            "authority_epoch_id": membrane.authority_epoch_id,
             "mission_id": mission_id,
-            "process_id": process_id,
-            "worker_session_id": worker_session_id,
+            "process_id": membrane.process_id,
+            "worker_session_id": membrane.session_id,
         },
         validator=validator,
         projector=projector,
         clock=clock,
     )
-    if _operation_was_completed(outcome):
+    if outcome.status == "completed":
         _write_json(
             Path(missions_root).resolve()
             / mission_id
             / "attempts"
-            / "0001"
+            / f"{membrane.attempt_number:04d}"
             / "processes"
-            / process_id
+            / membrane.process_id
             / "sessions"
-            / worker_session_id
+            / membrane.session_id
             / "session.json",
             {
-                "process_id": process_id,
-                "sequence": 1,
+                "process_id": membrane.process_id,
+                "sequence": membrane.session_sequence,
                 "state": "running",
-                "worker_session_id": worker_session_id,
+                "worker_session_id": membrane.session_id,
             },
         )
     return outcome
-
 
 def finish_mission(
     root: Path,
@@ -1431,13 +1708,25 @@ def finish_mission(
 ) -> OperationOutcome:
     """Admit a bound worker receipt and close the running attempt for verification."""
 
-    attempt_id = f"A-{mission_id}-0001"
-    process_id = f"P-{mission_id}-0001"
-    work_order_id = f"WO-{mission_id}-0001"
-    worker_session_id = f"S-{mission_id}-0001"
-    authority_epoch_id = f"AE-{mission_id}-0001"
     receipt_file = Path(receipt_path)
     receipt_bytes = receipt_file.read_bytes()
+    receipt_digest = _sha256_bytes(receipt_bytes)
+    replay = _recorded_liaison_replay(
+        root,
+        operation_id=operation_id,
+        action="mission_controls.finish",
+        mission_id=mission_id,
+        expected_revision=expected_revision,
+        event_payload={"receipt_digest": receipt_digest},
+    )
+    if replay is not None:
+        return replay
+    membrane = _current_worker_membrane(root, mission_id)
+    attempt_id = membrane.attempt_id
+    process_id = membrane.process_id
+    work_order_id = membrane.work_order_id
+    worker_session_id = membrane.session_id
+    authority_epoch_id = membrane.authority_epoch_id
     try:
         receipt = json.loads(receipt_bytes)
     except json.JSONDecodeError as exc:
@@ -1460,7 +1749,10 @@ def finish_mission(
         raise InvalidOperation("worker receipt does not match the dispatched membrane")
 
     attempt_dir = (
-        Path(missions_root).resolve() / mission_id / "attempts" / "0001"
+        Path(missions_root).resolve()
+        / mission_id
+        / "attempts"
+        / f"{membrane.attempt_number:04d}"
     )
     notes_path = attempt_dir / "notes.md"
     if not notes_path.is_file():
@@ -1496,16 +1788,36 @@ def finish_mission(
         raise InvalidOperation("worker notes do not match the admitted route")
     metadata = json.loads(str(session_metadata[0]))
     budget_seconds = int(metadata["budget_seconds"])
-    receipt_digest = _sha256_bytes(receipt_bytes)
     notes_digest = _sha256_bytes(notes_text.encode("utf-8"))
 
     expected_revisions = (
         ExpectedRevision("mission", mission_id, expected_revision),
-        ExpectedRevision("attempt", attempt_id, 1),
-        ExpectedRevision("process", process_id, 2),
-        ExpectedRevision("worker_session", worker_session_id, 2),
-        ExpectedRevision("authority_epoch", authority_epoch_id, 1),
-        ExpectedRevision("work_order", work_order_id, 1, role="read"),
+        ExpectedRevision(
+            "attempt",
+            attempt_id,
+            _aggregate_revision(root, "attempt", attempt_id),
+        ),
+        ExpectedRevision(
+            "process",
+            process_id,
+            _aggregate_revision(root, "process", process_id),
+        ),
+        ExpectedRevision(
+            "worker_session",
+            worker_session_id,
+            _aggregate_revision(root, "worker_session", worker_session_id),
+        ),
+        ExpectedRevision(
+            "authority_epoch",
+            authority_epoch_id,
+            _aggregate_revision(root, "authority_epoch", authority_epoch_id),
+        ),
+        ExpectedRevision(
+            "work_order",
+            work_order_id,
+            _aggregate_revision(root, "work_order", work_order_id),
+            role="read",
+        ),
     )
 
     def validator(context: _ValidationContext) -> GateRejection | None:
@@ -1702,211 +2014,11 @@ def finish_mission(
             {
                 "elapsed_seconds": elapsed_seconds,
                 "process_id": process_id,
-                "sequence": 1,
+                "sequence": membrane.session_sequence,
                 "state": "completed",
                 "worker_session_id": worker_session_id,
                 "within_budget": elapsed_seconds <= budget_seconds,
             },
-        )
-    return outcome
-
-
-def verify_mission(
-    root: Path,
-    missions_root: Path,
-    mission_id: str,
-    *,
-    operation_id: str,
-    expected_revision: int,
-    liaison_session_id: str,
-    site_root: Path,
-    clock: Callable[[], datetime] = utc_now,
-) -> OperationOutcome:
-    """Run the pinned landing acceptance checks and record immutable evidence."""
-
-    attempt_id = f"A-{mission_id}-0001"
-    process_id = f"P-{mission_id}-0001"
-    work_order_id = f"WO-{mission_id}-0001"
-    worker_session_id = f"S-{mission_id}-0001"
-    evidence_id = f"EV-{mission_id}-0001"
-    attempt_dir = (
-        Path(missions_root).resolve() / mission_id / "attempts" / "0001"
-    )
-    replay = _recorded_verification_replay(
-        root,
-        operation_id=operation_id,
-        mission_id=mission_id,
-        expected_revision=expected_revision,
-        evidence_id=evidence_id,
-    )
-    if replay is not None:
-        outcome, report, report_digest, manifest_digest = replay
-        _write_verification_projection(
-            attempt_dir,
-            process_id=process_id,
-            evidence_id=evidence_id,
-            report=report,
-            report_digest=report_digest,
-            manifest_digest=manifest_digest,
-        )
-        return outcome
-    report, report_digest, git_head, index_digest = _landing_acceptance_report(
-        site_root,
-        attempt_dir / "notes.md",
-        mission_id=mission_id,
-    )
-    verification_passed = bool(report["passed"])
-    exit_status = 0 if verification_passed else 1
-    target_state = (
-        MissionState.AWAITING_APPROVAL
-        if verification_passed
-        else MissionState.FAILED
-    )
-    manifest_digest = str(report["site_manifest_digest"])
-
-    with sqlite3.connect(Path(root).resolve() / "aos.db") as db:
-        contract = db.execute(
-            """
-            SELECT id, content_hash
-            FROM contract_revisions
-            WHERE mission_id=?
-            ORDER BY revision DESC
-            LIMIT 1
-            """,
-            (mission_id,),
-        ).fetchone()
-    if contract is None:
-        raise InvalidOperation("verified mission has no authorized contract")
-
-    expected_revisions = (
-        ExpectedRevision("mission", mission_id, expected_revision),
-        ExpectedRevision("evidence", evidence_id, 0),
-        ExpectedRevision("contract_revision", str(contract[0]), 1, role="read"),
-        ExpectedRevision("attempt", attempt_id, 2, role="read"),
-        ExpectedRevision("process", process_id, 3, role="read"),
-        ExpectedRevision("worker_session", worker_session_id, 3, role="read"),
-        ExpectedRevision("work_order", work_order_id, 1, role="read"),
-    )
-
-    def validator(context: _ValidationContext) -> GateRejection | None:
-        return _mission_state_rejection(
-            context,
-            mission_id=mission_id,
-            source=MissionState.VERIFYING,
-            target=target_state,
-        )
-
-    def projector(context: _ProjectionContext) -> None:
-        evidence_record = {
-            "attempt_id": attempt_id,
-            "command_hash": LANDING_COMMAND_DIGEST,
-            "contract_hash": str(contract[1]),
-            "contract_revision_id": str(contract[0]),
-            "ended_at": context.occurred_at,
-            "exit_status": exit_status,
-            "git_head": git_head,
-            "index_digest": index_digest,
-            "mission_id": mission_id,
-            "mission_revision": expected_revision,
-            "output_artifacts": [report_digest],
-            "process_id": process_id,
-            "record_schema_version": 1,
-            "started_at": context.occurred_at,
-            "verifier_spec_digest": LANDING_VERIFIER_SPEC_DIGEST,
-            "worker_session_id": worker_session_id,
-            "worktree_manifest_digest": manifest_digest,
-        }
-        validate_evidence_record(evidence_record)
-        evidence_digest = content_digest(evidence_record)
-        evidence_event = context.append_event(
-            "evidence.recorded",
-            "evidence",
-            evidence_id,
-            {
-                "evidence_digest": evidence_digest,
-                "evidence_id": evidence_id,
-                "exit_status": exit_status,
-                "mission_id": mission_id,
-                "report_digest": report_digest,
-                "verification_report": report,
-            },
-        )
-        context.db.execute(
-            """
-            INSERT INTO evidence_records(
-                digest, record_schema_version, mission_id, mission_revision,
-                contract_revision_id, contract_hash, attempt_id, process_id,
-                worker_session_id, git_head, index_digest,
-                worktree_manifest_digest, verifier_spec_digest, command_hash,
-                started_at, ended_at, exit_status, output_artifacts, source_event_id
-            ) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                evidence_digest,
-                mission_id,
-                expected_revision,
-                str(contract[0]),
-                str(contract[1]),
-                attempt_id,
-                process_id,
-                worker_session_id,
-                git_head,
-                index_digest,
-                manifest_digest,
-                LANDING_VERIFIER_SPEC_DIGEST,
-                LANDING_COMMAND_DIGEST,
-                context.occurred_at,
-                context.occurred_at,
-                exit_status,
-                json.dumps([report_digest], sort_keys=True),
-                evidence_event.event_id,  # type: ignore[attr-defined]
-            ),
-        )
-        context.append_event(
-            "mission.transitioned",
-            "mission",
-            mission_id,
-            {
-                "evidence_digest": evidence_digest,
-                "evidence_id": evidence_id,
-                "from_state": "verifying",
-                "to_state": str(target_state),
-            },
-        )
-        context.db.execute(
-            """
-            UPDATE missions
-            SET state=?, updated_at=?
-            WHERE id=?
-            """,
-            (str(target_state), context.occurred_at, mission_id),
-        )
-
-    outcome = _liaison_operation(
-        root,
-        operation_id=operation_id,
-        action="mission_controls.verify",
-        liaison_session_id=liaison_session_id,
-        expected_revisions=expected_revisions,
-        payload={
-            "mission_id": mission_id,
-            "report_digest": report_digest,
-            "site_manifest_digest": manifest_digest,
-            "verification_passed": verification_passed,
-            "verifier_spec_digest": LANDING_VERIFIER_SPEC_DIGEST,
-        },
-        validator=validator,
-        projector=projector,
-        clock=clock,
-    )
-    if _operation_was_completed(outcome):
-        _write_verification_projection(
-            attempt_dir,
-            process_id=process_id,
-            evidence_id=evidence_id,
-            report=report,
-            report_digest=report_digest,
-            manifest_digest=manifest_digest,
         )
     return outcome
 
@@ -2092,7 +2204,7 @@ def _liaison_session_from_env(value: str | None) -> str:
 def _worker_token_from_env() -> str:
     worker_token = os.environ.get("AOS_WORKER_TOKEN")
     if not worker_token:
-        raise InvalidOperation("AOS_WORKER_TOKEN is required for dispatch")
+        raise InvalidOperation("AOS_WORKER_TOKEN is required")
     return worker_token
 
 
@@ -2138,17 +2250,17 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--op", required=True)
     start.add_argument("--expect", required=True, type=int)
 
+    replace = subparsers.add_parser("replace-worker")
+    replace.add_argument("mission_id")
+    replace.add_argument("--budget-seconds", required=True, type=int)
+    replace.add_argument("--op", required=True)
+    replace.add_argument("--expect", required=True, type=int)
+
     finish = subparsers.add_parser("finish")
     finish.add_argument("mission_id")
     finish.add_argument("--receipt", required=True)
     finish.add_argument("--op", required=True)
     finish.add_argument("--expect", required=True, type=int)
-
-    verify = subparsers.add_parser("verify")
-    verify.add_argument("mission_id")
-    verify.add_argument("--site-root", required=True)
-    verify.add_argument("--op", required=True)
-    verify.add_argument("--expect", required=True, type=int)
 
     status = subparsers.add_parser("status")
     status.add_argument("mission_id")
@@ -2241,6 +2353,22 @@ def main(argv: list[str] | None = None) -> int:
             )
             if not _result_is_rejected(result):
                 result.update(mission_status(root, missions_root, args.mission_id))
+        elif args.command == "replace-worker":
+            session_id = _liaison_session_from_env(args.liaison_session)
+            result = _outcome_json(
+                replace_worker(
+                    root,
+                    missions_root,
+                    args.mission_id,
+                    operation_id=args.op,
+                    expected_revision=args.expect,
+                    liaison_session_id=session_id,
+                    worker_token=_worker_token_from_env(),
+                    budget_seconds=args.budget_seconds,
+                )
+            )
+            if not _result_is_rejected(result):
+                result.update(mission_status(root, missions_root, args.mission_id))
         elif args.command == "finish":
             session_id = _liaison_session_from_env(args.liaison_session)
             result = _outcome_json(
@@ -2252,21 +2380,6 @@ def main(argv: list[str] | None = None) -> int:
                     expected_revision=args.expect,
                     liaison_session_id=session_id,
                     receipt_path=Path(args.receipt),
-                )
-            )
-            if not _result_is_rejected(result):
-                result.update(mission_status(root, missions_root, args.mission_id))
-        elif args.command == "verify":
-            session_id = _liaison_session_from_env(args.liaison_session)
-            result = _outcome_json(
-                verify_mission(
-                    root,
-                    missions_root,
-                    args.mission_id,
-                    operation_id=args.op,
-                    expected_revision=args.expect,
-                    liaison_session_id=session_id,
-                    site_root=Path(args.site_root),
                 )
             )
             if not _result_is_rejected(result):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -17,8 +18,8 @@ from modules.mission_controls import (
     intake_mission,
     mission_status,
     propose_contract,
+    replace_worker,
     start_mission,
-    verify_mission,
 )
 from modules.mission_controls import (
     main as mission_main,
@@ -72,37 +73,21 @@ def _write_decision(path: Path) -> None:
     )
 
 
-def _worker_receipt() -> dict[str, object]:
+def _worker_receipt(
+    *,
+    authority_epoch_id: str = "AE-M-LANDING-0001",
+    worker_session_id: str = "S-M-LANDING-0001",
+) -> dict[str, object]:
     return {
         "attempt_id": "A-M-LANDING-0001",
-        "authority_epoch_id": "AE-M-LANDING-0001",
+        "authority_epoch_id": authority_epoch_id,
         "mission_id": "M-LANDING",
         "process_id": "P-M-LANDING-0001",
         "schema_version": 1,
         "status": "completed",
         "work_order_id": "WO-M-LANDING-0001",
-        "worker_session_id": "S-M-LANDING-0001",
+        "worker_session_id": worker_session_id,
     }
-
-
-def _write_passing_site(site: Path) -> None:
-    site.mkdir()
-    (site / "index.html").write_text(
-        """<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>aOS</title></head>
-<body>
-  <main>
-    <h1 data-primary-brand>aOS</h1>
-    <p data-product-sentence>
-      aOS is a sparse agent OS that keeps mission state durable and delivery evidence-bound.
-    </p>
-    <a data-primary-cta href="https://github.com/valenzmanu/aOS">View on GitHub</a>
-  </main>
-</body>
-</html>
-"""
-    )
 
 
 def _dispatch_fixture(tmp_path: Path) -> tuple[Path, Path]:
@@ -157,38 +142,6 @@ def _dispatch_fixture(tmp_path: Path) -> tuple[Path, Path]:
         workspace="repo-root/tyr-site",
         worker_token="worker-capability-material-" + ("x" * 32),
         budget_seconds=900,
-    )
-    return root, missions
-
-
-def _finished_fixture(tmp_path: Path) -> tuple[Path, Path]:
-    root, missions = _dispatch_fixture(tmp_path)
-    start_mission(
-        root,
-        missions,
-        "M-LANDING",
-        operation_id="OP-DF-START",
-        expected_revision=3,
-        liaison_session_id=LIAISON_SESSION_ID,
-    )
-    attempt_dir = missions / "M-LANDING" / "attempts" / "0001"
-    (attempt_dir / "notes.md").write_text(
-        "# Worker notes\n\n"
-        "- Harness: t3-code\n"
-        "- Model: gpt-5.6-sol\n"
-        "- Elapsed-seconds: 420\n"
-        "- Outcome: completed\n"
-    )
-    receipt = attempt_dir / "receipt.json"
-    receipt.write_text(json.dumps(_worker_receipt()))
-    finish_mission(
-        root,
-        missions,
-        "M-LANDING",
-        operation_id="OP-DF-FINISH",
-        expected_revision=4,
-        liaison_session_id=LIAISON_SESSION_ID,
-        receipt_path=receipt,
     )
     return root, missions
 
@@ -744,8 +697,16 @@ def test_finish_rejects_receipt_relayed_after_worker_authority_expiry(
     assert still_open.status == "active"
 
 
-def test_verify_records_passing_acceptance_evidence(tmp_path: Path) -> None:
+def test_replace_worker_recovers_the_same_work_without_overlapping_authority(
+    tmp_path: Path,
+) -> None:
     root, missions = _dispatch_fixture(tmp_path)
+    first_token = "worker-capability-material-" + ("x" * 32)
+    replacement_token = "replacement-capability-material-" + ("y" * 32)
+    recovery_session_id = "LS-TEST-RECOVERY"
+    partial_artifact = tmp_path / "shared-worktree" / "artifact.txt"
+    partial_artifact.parent.mkdir()
+    partial_artifact.write_text("preserved partial work\n")
     start_mission(
         root,
         missions,
@@ -754,367 +715,198 @@ def test_verify_records_passing_acceptance_evidence(tmp_path: Path) -> None:
         expected_revision=3,
         liaison_session_id=LIAISON_SESSION_ID,
     )
+    expanded = replace_worker(
+        root,
+        missions,
+        "M-LANDING",
+        operation_id="OP-DF-REPLACE-EXPANDED",
+        expected_revision=4,
+        liaison_session_id=recovery_session_id,
+        worker_token=replacement_token,
+        budget_seconds=901,
+    )
+    assert expanded.status == "rejected"
+    assert expanded.reason == "replacement_budget_expanded"
+
+    outcome = replace_worker(
+        root,
+        missions,
+        "M-LANDING",
+        operation_id="OP-DF-REPLACE",
+        expected_revision=4,
+        liaison_session_id=recovery_session_id,
+        worker_token=replacement_token,
+        budget_seconds=600,
+    )
+
+    assert outcome.status == "completed"
+    assert partial_artifact.read_text() == "preserved partial work\n"
+    replay = replace_worker(
+        root,
+        missions,
+        "M-LANDING",
+        operation_id="OP-DF-REPLACE",
+        expected_revision=4,
+        liaison_session_id="LS-TEST-RECOVERY-REPLAY",
+        worker_token=replacement_token,
+        budget_seconds=600,
+    )
+    assert replay.status == "replayed"
+    assert replay.original_status == "completed"
+    stale = replace_worker(
+        root,
+        missions,
+        "M-LANDING",
+        operation_id="OP-DF-REPLACE-STALE",
+        expected_revision=4,
+        liaison_session_id=recovery_session_id,
+        worker_token="stale-replacement-capability-" + ("z" * 32),
+        budget_seconds=500,
+    )
+    assert stale.status == "rejected"
+    assert stale.reason == "worker_membrane_not_replaceable"
+    status = mission_status(root, missions, "M-LANDING")
+    assert status["state"] == "implementing"
+    assert status["revision"] == 4
+    assert status["attempt_id"] == "A-M-LANDING-0001"
+    assert status["process_id"] == "P-M-LANDING-0001"
+    assert status["process_state"] == "created"
+    assert status["worker_session_id"] == "S-M-LANDING-0002"
+    assert status["worker_session_state"] == "created"
+
+    events = read_events(root)
+    process_reset = [
+        (
+            event.kind,
+            event.payload.get("from_state"),
+            event.payload.get("to_state"),
+        )
+        for event in events
+        if event.aggregate_id == "P-M-LANDING-0001"
+        and event.kind == "process.transitioned"
+    ]
+    assert ("process.transitioned", "running", "created") in process_reset
+    revoked = next(
+        event
+        for event in events
+        if event.kind == "authority.revoked"
+        and event.aggregate_id == "AE-M-LANDING-0001"
+    )
+    claimed = next(
+        event
+        for event in events
+        if event.kind == "authority.claimed"
+        and event.aggregate_id == "AE-M-LANDING-0002"
+    )
+    assert revoked.event_id < claimed.event_id
+    assert revoked.envelope is not None
+    assert claimed.envelope is not None
+    assert revoked.envelope["operation_id"] == "OP-DF-REPLACE"
+    assert claimed.envelope["operation_id"] == "OP-DF-REPLACE"
+
+    restart = start_mission(
+        root,
+        missions,
+        "M-LANDING",
+        operation_id="OP-DF-RESTART",
+        expected_revision=4,
+        liaison_session_id=recovery_session_id,
+    )
+    assert restart.status == "completed"
+    restart_replay = start_mission(
+        root,
+        missions,
+        "M-LANDING",
+        operation_id="OP-DF-RESTART",
+        expected_revision=4,
+        liaison_session_id="LS-TEST-RECOVERY-REPLAY",
+    )
+    assert restart_replay.status == "replayed"
+    status = mission_status(root, missions, "M-LANDING")
+    assert status["state"] == "implementing"
+    assert status["revision"] == 4
+    assert status["process_state"] == "running"
+    assert status["worker_session_id"] == "S-M-LANDING-0002"
+    assert status["worker_session_state"] == "running"
+
     attempt_dir = missions / "M-LANDING" / "attempts" / "0001"
     (attempt_dir / "notes.md").write_text(
         "# Worker notes\n\n"
         "- Harness: t3-code\n"
         "- Model: gpt-5.6-sol\n"
-        "- Elapsed-seconds: 420\n"
+        "- Elapsed-seconds: 120\n"
         "- Outcome: completed\n"
     )
     receipt = attempt_dir / "receipt.json"
     receipt.write_text(json.dumps(_worker_receipt()))
-    finish_mission(
-        root,
-        missions,
-        "M-LANDING",
-        operation_id="OP-DF-FINISH",
-        expected_revision=4,
-        liaison_session_id=LIAISON_SESSION_ID,
-        receipt_path=receipt,
-    )
-    site = tmp_path / "tyr-site"
-    site.mkdir()
-    (site / "index.html").write_text(
-        """<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><title>aOS</title></head>
-<body>
-  <main>
-    <h1 data-primary-brand>aOS</h1>
-    <p data-product-sentence>
-      aOS is a sparse agent OS that keeps mission state durable and delivery evidence-bound.
-    </p>
-    <a data-primary-cta href="https://github.com/valenzmanu/aOS">View on GitHub</a>
-  </main>
-</body>
-</html>
-"""
-    )
-
-    outcome = verify_mission(
-        root,
-        missions,
-        "M-LANDING",
-        operation_id="OP-DF-VERIFY",
-        expected_revision=5,
-        liaison_session_id=LIAISON_SESSION_ID,
-        site_root=site,
-    )
-
-    assert outcome.status == "completed"
-    status = mission_status(root, missions, "M-LANDING")
-    assert status["state"] == "awaiting_approval"
-    assert status["revision"] == 6
-    assert status["evidence_id"] == "EV-M-LANDING-0001"
-    assert isinstance(status["evidence_digest"], str)
-    report_path = (
-        attempt_dir
-        / "processes"
-        / "P-M-LANDING-0001"
-        / "evidence"
-        / "EV-M-LANDING-0001"
-        / "verification.json"
-    )
-    report = json.loads(report_path.read_text())
-    assert report["passed"] is True
-    assert [check["name"] for check in report["checks"]] == [
-        "single_static_page",
-        "primary_brand_aos",
-        "product_sentence",
-        "github_primary_cta",
-        "privacy_scan",
-        "worker_attempt_notes",
-    ]
-    assert all(check["passed"] for check in report["checks"])
-    evidence_event = next(
-        event for event in read_events(root) if event.kind == "evidence.recorded"
-    )
-    assert evidence_event.payload["verification_report"] == report
-
-
-def test_verify_replay_uses_recorded_report_after_site_changes(
-    tmp_path: Path,
-) -> None:
-    root, missions = _finished_fixture(tmp_path)
-    site = tmp_path / "tyr-site"
-    _write_passing_site(site)
-    operation_id = "OP-DF-VERIFY-REPLAY"
-
-    initial = verify_mission(
-        root,
-        missions,
-        "M-LANDING",
-        operation_id=operation_id,
-        expected_revision=5,
-        liaison_session_id=LIAISON_SESSION_ID,
-        site_root=site,
-    )
-    assert initial.status == "completed"
-    evidence_dir = (
-        missions
-        / "M-LANDING"
-        / "attempts"
-        / "0001"
-        / "processes"
-        / "P-M-LANDING-0001"
-        / "evidence"
-        / "EV-M-LANDING-0001"
-    )
-    expected_report = json.loads((evidence_dir / "verification.json").read_text())
-    event_ids = [event.event_id for event in read_events(root)]
-
-    (site / "index.html").write_text("<h1>changed after verification</h1>\n")
-    (evidence_dir / "verification.json").unlink()
-    (evidence_dir / "evidence.json").unlink()
-
-    replay = verify_mission(
-        root,
-        missions,
-        "M-LANDING",
-        operation_id=operation_id,
-        expected_revision=5,
-        liaison_session_id=LIAISON_SESSION_ID,
-        site_root=site,
-    )
-
-    assert replay.status == "replayed"
-    assert replay.original_status == "completed"
-    assert json.loads((evidence_dir / "verification.json").read_text()) == expected_report
-    assert [event.event_id for event in read_events(root)] == event_ids
-
-
-def test_verify_records_failed_evidence_and_blocks_approval(tmp_path: Path) -> None:
-    root, missions = _finished_fixture(tmp_path)
-    site = tmp_path / "tyr-site"
-    site.mkdir()
-    (site / "index.html").write_text(
-        """<!doctype html>
-<html lang="en">
-<body>
-  <main>
-    <h1 data-primary-brand>TYR</h1>
-    <p data-product-sentence>TYR is a generic landing page with stale branding.</p>
-    <a data-primary-cta href="https://github.com/valenzmanu/aOS">View on GitHub</a>
-  </main>
-</body>
-</html>
-"""
-    )
-
-    outcome = verify_mission(
-        root,
-        missions,
-        "M-LANDING",
-        operation_id="OP-DF-VERIFY-FAIL",
-        expected_revision=5,
-        liaison_session_id=LIAISON_SESSION_ID,
-        site_root=site,
-    )
-
-    assert outcome.status == "completed"
-    status = mission_status(root, missions, "M-LANDING")
-    assert status["state"] == "failed"
-    assert status["revision"] == 6
-    assert status["evidence_id"] == "EV-M-LANDING-0001"
-    report_path = (
-        missions
-        / "M-LANDING"
-        / "attempts"
-        / "0001"
-        / "processes"
-        / "P-M-LANDING-0001"
-        / "evidence"
-        / "EV-M-LANDING-0001"
-        / "verification.json"
-    )
-    report = json.loads(report_path.read_text())
-    assert report["passed"] is False
-    failed_checks = {
-        check["name"] for check in report["checks"] if not check["passed"]
-    }
-    assert "primary_brand_aos" in failed_checks
-
-
-def test_failed_verifier_result_is_completed_operation_not_gate_rejection(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    root, missions = _finished_fixture(tmp_path)
-    site = tmp_path / "tyr-site"
-    site.mkdir()
-    (site / "index.html").write_text("<h1>incomplete</h1>\n")
-    monkeypatch.setenv("AOS_STATE_ROOT", str(root))
-    monkeypatch.setenv("AOS_MISSIONS_ROOT", str(missions))
-    monkeypatch.setenv("AOS_LIAISON_SESSION_ID", LIAISON_SESSION_ID)
-
-    exit_code = mission_main(
-        [
-            "verify",
-            "M-LANDING",
-            "--site-root",
-            str(site),
-            "--op",
-            "OP-DF-VERIFY-FAIL",
-            "--expect",
-            "5",
-        ]
-    )
-
-    result = json.loads(capsys.readouterr().out)
-    assert exit_code == 0
-    assert result["status"] == "completed"
-    assert result["state"] == "failed"
-    assert result["rejection_event_id"] is None
-
-
-def test_verify_rejects_secret_keyed_site_metadata(tmp_path: Path) -> None:
-    root, missions = _finished_fixture(tmp_path)
-    site = tmp_path / "tyr-site"
-    site.mkdir()
-    (site / "index.html").write_text(
-        """<!doctype html>
-<html lang="en">
-<body>
-  <main>
-    <h1 data-primary-brand>aOS</h1>
-    <p data-product-sentence>
-      aOS is a sparse agent OS that keeps mission state durable and delivery evidence-bound.
-    </p>
-    <a data-primary-cta href="https://github.com/valenzmanu/aOS">View on GitHub</a>
-  </main>
-</body>
-</html>
-"""
-    )
-    (site / ".deployment.json").write_text(
-        json.dumps({"claim" + "Token": "placeholder-" + ("x" * 32)})
-    )
-
-    verify_mission(
-        root,
-        missions,
-        "M-LANDING",
-        operation_id="OP-DF-VERIFY-SECRET",
-        expected_revision=5,
-        liaison_session_id=LIAISON_SESSION_ID,
-        site_root=site,
-    )
-
-    status = mission_status(root, missions, "M-LANDING")
-    assert status["state"] == "failed"
-    report_path = (
-        missions
-        / "M-LANDING"
-        / "attempts"
-        / "0001"
-        / "processes"
-        / "P-M-LANDING-0001"
-        / "evidence"
-        / "EV-M-LANDING-0001"
-        / "verification.json"
-    )
-    report = json.loads(report_path.read_text())
-    privacy = next(
-        check for check in report["checks"] if check["name"] == "privacy_scan"
-    )
-    assert privacy["passed"] is False
-
-
-def test_verify_rejects_symlinks_without_recording_their_targets(
-    tmp_path: Path,
-) -> None:
-    root, missions = _finished_fixture(tmp_path)
-    site = tmp_path / "tyr-site"
-    _write_passing_site(site)
-    private_target = "/" + "Users" + "/private/" + "state/aos.db"
-    (site / "legacy-state").symlink_to(private_target)
-
-    verify_mission(
-        root,
-        missions,
-        "M-LANDING",
-        operation_id="OP-DF-VERIFY-SYMLINK",
-        expected_revision=5,
-        liaison_session_id=LIAISON_SESSION_ID,
-        site_root=site,
-    )
-
-    assert mission_status(root, missions, "M-LANDING")["state"] == "failed"
-    evidence_event = next(
-        event for event in read_events(root) if event.kind == "evidence.recorded"
-    )
-    serialized_event = json.dumps(evidence_event.payload, sort_keys=True)
-    assert private_target not in serialized_event
-    report = evidence_event.payload["verification_report"]
-    assert isinstance(report, dict)
-    privacy = next(
-        check for check in report["checks"] if check["name"] == "privacy_scan"
-    )
-    assert privacy["passed"] is False
-    assert privacy["details"]["symlink_count"] == 1
-
-
-def test_verify_rejects_a_symlinked_site_root(tmp_path: Path) -> None:
-    root, missions = _finished_fixture(tmp_path)
-    passing_site = tmp_path / "passing-site"
-    _write_passing_site(passing_site)
-    site_link = tmp_path / "site-link"
-    site_link.symlink_to(passing_site, target_is_directory=True)
-
-    with pytest.raises(InvalidOperation, match="site root must not be a symlink"):
-        verify_mission(
+    with pytest.raises(InvalidOperation, match="receipt does not match"):
+        finish_mission(
             root,
             missions,
             "M-LANDING",
-            operation_id="OP-DF-VERIFY-ROOT-SYMLINK",
-            expected_revision=5,
-            liaison_session_id=LIAISON_SESSION_ID,
-            site_root=site_link,
+            operation_id="OP-DF-FINISH-STALE",
+            expected_revision=4,
+            liaison_session_id=recovery_session_id,
+            receipt_path=receipt,
         )
 
-    assert mission_status(root, missions, "M-LANDING")["state"] == "verifying"
-    assert not any(event.kind == "evidence.recorded" for event in read_events(root))
-
-
-def test_verify_report_never_records_attacker_controlled_site_values(
-    tmp_path: Path,
-) -> None:
-    root, missions = _finished_fixture(tmp_path)
-    site = tmp_path / "tyr-site"
-    site.mkdir()
-    private_value = "/" + "Users" + "/private/" + "state/aos.db"
-    token_value = "Bearer " + ("x" * 28)
-    (site / "index.html").write_text(
-        f"""<!doctype html>
-<html lang="en">
-<body>
-  <main>
-    <h1 data-primary-brand>{private_value}</h1>
-    <p data-product-sentence>
-      aOS is a sparse agent OS that keeps mission state durable and delivery evidence-bound.
-    </p>
-    <a data-primary-cta href="{token_value}">View on GitHub</a>
-  </main>
-</body>
-</html>
-"""
+    receipt.write_text(
+        json.dumps(
+            _worker_receipt(
+                authority_epoch_id="AE-M-LANDING-0002",
+                worker_session_id="S-M-LANDING-0002",
+            )
+        )
     )
-
-    verify_mission(
+    finish = finish_mission(
         root,
         missions,
         "M-LANDING",
-        operation_id="OP-DF-VERIFY-SANITIZED",
-        expected_revision=5,
-        liaison_session_id=LIAISON_SESSION_ID,
-        site_root=site,
+        operation_id="OP-DF-FINISH-REPLACEMENT",
+        expected_revision=4,
+        liaison_session_id=recovery_session_id,
+        receipt_path=receipt,
     )
 
-    evidence_event = next(
-        event for event in read_events(root) if event.kind == "evidence.recorded"
+    assert finish.status == "completed"
+    finish_replay = finish_mission(
+        root,
+        missions,
+        "M-LANDING",
+        operation_id="OP-DF-FINISH-REPLACEMENT",
+        expected_revision=4,
+        liaison_session_id="LS-TEST-RECOVERY-REPLAY",
+        receipt_path=receipt,
     )
-    serialized_event = json.dumps(evidence_event.payload, sort_keys=True)
-    assert private_value not in serialized_event
-    assert token_value not in serialized_event
+    assert finish_replay.status == "replayed"
+    status = mission_status(root, missions, "M-LANDING")
+    assert status["state"] == "verifying"
+    assert status["revision"] == 5
+    assert status["attempt_state"] == "completed"
+    assert status["process_state"] == "completed"
+    assert status["worker_session_state"] == "completed"
+    with sqlite3.connect(root / "aos.db") as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM attempts WHERE mission_id='M-LANDING'"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM processes WHERE mission_id='M-LANDING'"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT COUNT(*) FROM work_orders WHERE mission_id='M-LANDING'"
+        ).fetchone()[0] == 1
+        assert db.execute(
+            "SELECT state FROM worker_sessions WHERE id='S-M-LANDING-0001'"
+        ).fetchone()[0] == "orphaned"
+    first_epoch = read_authority_epoch(root, "AE-M-LANDING-0001")
+    replacement_epoch = read_authority_epoch(root, "AE-M-LANDING-0002")
+    assert first_epoch is not None
+    assert replacement_epoch is not None
+    assert first_epoch.status == "revoked"
+    assert replacement_epoch.status == "released"
+    for directory in (root, missions):
+        for path in directory.rglob("*"):
+            if path.is_file():
+                contents = path.read_bytes()
+                assert first_token.encode() not in contents
+                assert replacement_token.encode() not in contents

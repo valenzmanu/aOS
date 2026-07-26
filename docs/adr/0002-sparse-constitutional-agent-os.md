@@ -3,234 +3,146 @@ status: accepted
 date: 2026-07-22
 decision_owners: aOS maintainers
 supersedes-direction-of: historical 0.1 plan at e920ff2:docs/aos-poc-plan.md
-related: ADR 0001 (unmerged analysis; multi-session liaison direction incorporated here)
 ---
 
-# Sparse Constitutional Agent OS (SCAOS)
+# Sparse Constitutional Agent OS
 
-> **Implementation status:** the repository-source cutover is complete. The superseded `aos/`
-> runtime and its orchestration entrypoints have been removed. Historical source remains available
-> in Git; archived schema fixtures remain only as inputs to the v2 migration tests.
+## Decision
 
-aOS 2.0 is rebuilt on a different substrate. The 0.1 implementation was a correct prototype of
-the wrong architecture: it embodied the OS as a Python control plane (`aos/*.py`) that agents call
-through a CLI. This ADR replaces that substrate with agents navigating a file tree, guided by a
-portable instruction distro, with determinism confined to sparse modules at governance-critical
-joints. The governance theory of 0.1 — authority and mission truth outside any harness context,
-verification before approval, scoped worker authority — is retained unchanged.
+> Agents are the runtime, files are the interface, the journal is the truth, and deterministic
+> code exists only at constitutional joints.
 
-## Thesis
+aOS preserves durable, governed mission work outside any agent conversation while leaving
+reasoning and execution to agents.
 
-> **aOS is a journal wearing a file tree as its interface.** Agents are the runtime: they navigate
-> mission state as files, guided by a portable distro of protocols and skills. Determinism exists
-> only at the constitutional joints — a small, ratcheted set of modules that agents invoke for
-> reliable mechanics or that gate governance-critical transitions. Canonical truth for contested
-> state lives behind the modules, not in the files.
+The earlier architecture embodied aOS as a Python control plane that orchestrated agent work. That
+was the wrong primitive for a system whose reasoning runtime is a model and whose processes are
+harness sessions. aOS is instead a world agents inhabit: a portable instruction distro, a readable
+State Tree, and a canonical journal.
 
-One-line form: **agents are the runtime, files are the interface, the journal is the truth,
-determinism only at the joints.**
+Pure intent is insufficient where improvisation could corrupt admission, authority, evidence, or
+approval. Those narrow facts remain deterministic and transactionally enforced.
 
-## Why the direction changed
+## Substrates
 
-Three independent sources converged on the same conclusion during review of 0.1:
+| Substrate | Role |
+| --- | --- |
+| **Agents** | Interpret goals, plan, route, supervise, diagnose, recover, and execute. They are replaceable and intentionally non-deterministic. |
+| **Distro** | Portable `AGENTS.md`, protocols, and skills that turn a general harness into an aOS participant. |
+| **State Tree** | Inspectable mission, contract, work-order, session, checkpoint, and evidence files. Authored files preserve rationale; generated files are journal-derived views. |
+| **Journal** | SQLite-backed canonical truth for contested events, revisions, admission, authority, evidence, and approval. |
 
-1. **firstmate's "agent distro" repositioning and the code-as-intent observation**
-   ([tweet](https://x.com/kunchenguid/status/2078264987857150010)): a broken bash script did not
-   break firstmate — the agent read the intent and worked around it. What you write for agents is
-   no longer code ("here's what you do"); it is intent ("here's what I want"). Intent does not
-   crash; its failure modes are *misses* (misarticulation, misunderstanding of demand). firstmate
-   is therefore not an app but a distro: a portable directory of instructions, skills, tooling,
-   policies, and state conventions that turns a general-purpose agent into a specialized one.
-2. **Interpretable Context Methodology** ([arXiv:2603.16021](https://arxiv.org/abs/2603.16021),
-   Van Clief & McDermott): filesystem structure replaces framework orchestration. Folder hierarchy
-   is stage sequencing, context scoping, state management, and coordination. "The filesystem is
-   doing the work that a framework would otherwise do in code."
-3. **Google's Open Knowledge Format**: knowledge for agents as a portable directory of markdown
-   with minimal frontmatter conventions — the same primitive shift applied to knowledge packs.
-
-The shared insight: **programming languages are the wrong primitive for an OS whose CPU is models
-and whose processes are harness sessions.** 0.1's Python kernel sat beside the agent ecosystem
-instead of inside it; every privileged action crossed a process/language boundary, and the "OS"
-was a durable ledger around a chat rather than a world agents inhabit.
-
-But pure intent cannot govern. An OS whose goal is to *govern and manage* agents needs
-deterministic components exactly where an agent freestyling would corrupt authority, isolation,
-evidence, or protocol — and nowhere else.
-
-## The four layers
-
-| Layer | Substrate | Nature |
-| --- | --- | --- |
-| **Journal** | SQLite for v2, behind the `journal`/`protocol`/`lease` modules | Deterministic and transactionally atomic through the canonical module API. Append-only is API-enforced at assurance level 1. The only canonical store for contested state: transitions, authority, evidence, leases. Replacing SQLite requires a new ADR. |
-| **State Tree** | Files: `missions/`, contracts, work orders, checkpoints, artifacts, projections | The navigable interface. Authored files (drafts, rationale, briefings) are editable and authoritative as files. Generated snapshots/projections are journal-derived and editing them creates divergence rather than canonical truth. |
-| **Distro** | `AGENTS.md`, `protocols/`, `skills/` | Portable intent. Instantiates a general agent as liaison, worker, or verifier. Constitution files are hash-pinned in the journal so drift is detectable. |
-| **Agents** | Any harness: Cursor, Codex, CLI, future | The runtime. Non-deterministic by design. Replaceable without loss of state. |
+The clone is the installation unit. aOS preserves mission state; it does not replace harness memory
+or copy private conversation history.
 
 ## Resident liaison behavior
 
-The liaison is not an object, process, daemon, lease holder, or exclusive capability. It is the
-root-scoped operating behavior of agent harnesses resident in an aOS root. Reading that root's
-`AGENTS.md` is sufficient to enter liaison behavior; discovering a separate state root or claiming
-global ownership is not required. Any number of harness sessions may act concurrently.
+Every harness operating in an aOS root may act as a resident liaison. There is no exclusive
+liaison process, lease, claim, activation ceremony, expiry, transfer, or takeover.
 
-Before its first governed mission mutation, each harness authors a unique record under
-`state/liaison/sessions/`. These records provide attribution, focus, observations, and narrative
-checkpoints. They are not canonical authority, never block another session, and may remain stale
-after a terminal or harness disappears. The journal identifies each liaison mutation by its
-session ID. Expected aggregate revisions, operation IDs, canonical request hashes, and external
-effect intents resolve actual conflicts at the narrowest contested boundary. Session attribution
-is excluded from the semantic request hash so another resident session can safely replay an
-identical operation after a crash; the original admitting session remains in the event envelope.
+Before its first governed mission mutation, a harness authors a unique `LS-*` session record for
+attribution and useful narrative checkpoints. A session record grants no authority, establishes no
+canonical mission truth, blocks nothing, and need not be closed.
 
-This makes the role resilient by construction: a forgotten terminal or orphan process owns
-nothing that must expire, transfer, release, or be taken over. Human authorization and approval
-remain explicit attributed decisions, and scoped worker/process capabilities remain expiring
-authority epochs. At assurance level 1, resident liaison attribution remains cooperative rather
-than authentication against a hostile local process.
+Expected revisions reject stale conflicting mutations. Operation IDs and canonical request hashes
+make effects replay-safe. A different resident session may replay an identical operation after a
+crash; the journal retains the original admitting session as provenance.
 
-The cutover is additive at schema 4 because event envelopes already permit an absent authority
-epoch. Historical active liaison-epoch rows are inert under the new admission path and may be
-closed by the replay-safe `journal.retire_liaison_authority` maintenance operation. Their cleanup
-never gates a resident session and does not rewrite their original events.
+Human authorization and approval remain explicit attributed decisions. Workers receive scoped,
+expiring authority. At cooperative assurance, human identity is recorded provenance rather than
+cryptographic authentication.
 
-## Two attachment modes
+## Constitutional joints
 
-Deterministic modules attach to the system in exactly two ways:
+Deterministic modules attach in two ways:
 
-- **Invoke** — an agent calls a module for mechanics it should not freestyle: worktree creation,
-  journal append, verification runs.
-- **Gate** — a module admits or rejects a proposed transition: authorize, dispatch, approve,
-  retry-level, or worker authority delegation. Rejections are journaled.
+- **Invoke:** an agent requests reliable mechanics it should not reproduce ad hoc.
+- **Gate:** a module admits or rejects a proposed contested mutation on the canonical path. Both
+  outcomes leave durable journal facts.
 
-Decision procedure for every feature:
+Use this decision:
 
 ```text
-What can go wrong if an agent freestyles this?
-  → nothing governance-critical     → State Tree + Distro only
-  → needs reliable mechanics        → Module (invoke)
-  → must be rejected on the
-    canonical transition path       → Module (gate) on the transition
-  → both                            → invoke for mechanics + gate for admit
+Could an agent freestyle this without corrupting admission, authority,
+evidence, approval, or durable mission truth?
+  yes → agent + distro + files
+  no, reliable mechanics suffice → invoke
+  no, the mutation must be rejected → gate
+  both → invoke mechanics and gate admission
 ```
 
-Rule of thumb: if a failure mode is "agent ignored the rule", it belongs in a deterministic
-module. If it is "bad articulation / bad judgment", it belongs in the intent layer.
+Routing, supervision, recovery judgment, retry choice, briefing, escalation, compaction, harness
+selection, and mission-quality evaluation remain agent behavior unless a concrete failure proves
+that one of the protected facts cannot remain sound.
 
-## Staged enforcement (honest gates)
+### Ratchet
 
-- **Level 1 (cooperative, now):** gates enforce the canonical API, not the underlying filesystem
-  against a hostile local process. Unauthorized tree edits do not become canonical transitions
-  and are detected when a gate, tool command, or reconciliation pass compares tree and journal,
-  provided the journal remains intact. Direct journal tampering is outside level-1 assurance.
-  Detection is opportunistic when a tool runs; there is no claim of continuous enforcement.
-- **Level 2 (physical, later):** gates become process/permission boundaries — state owned by a
-  separate OS user, modules as the only writable surface. The domain protocol does not change
-  between levels; only the wall gets harder.
+A new deterministic module, gate, or expansion of deterministic authority requires a demonstrated
+freestyle failure: an incident, learning mission, or acceptance test. Workflow convenience and
+speculative completeness are insufficient.
 
-aOS must never present level-1 guarantees as level-2. This was already 0.1's honest posture; it
-is now normative.
+Apply the deletion test continuously. If deleting a module removes complexity without forcing an
+essential invariant into several callers, the module did not earn its place.
 
-## The ratchet rule
+Constitutional behavior is named by the invariant it protects, not by a predetermined file
+catalog. Splitting one deep module into several shallow files is not architectural progress.
 
-A new deterministic module, a new gate, or an expansion of an existing module's authority may be
-added **only** with a demonstrated freestyle failure — an incident, a failed learning mission, or
-an acceptance test proving agents cannot be trusted with that transition. Workflow convenience is
-never sufficient grounds. Pure utilities, harness adapters, renderers, and eval checks do not
-become constitutional merely because they are code. This is the constitutional amendment process;
-it is deliberately annoying. Without it, "sparse" erodes back into a framework.
+## Assurance
 
-## Constitutional module catalog (v0)
+Current level-1 assurance governs cooperative actors through the canonical module interface.
+Unauthorized file edits do not become canonical transitions and can be detected when journal and
+State Tree are compared. aOS does not prevent a hostile local process from modifying SQLite or the
+filesystem directly, and it does not claim continuous enforcement.
 
-| Module | Attach | Guarantees |
-| --- | --- | --- |
-| `lease` | invoke + gate | scoped, expiring worker/process authority |
-| `journal` | invoke | append-only event log; atomic append + projection update |
-| `protocol` | gate | legal mission/process FSM transitions only |
-| `authz` | gate | capability checks on privileged transitions |
-| `worktree` | invoke | one isolated git worktree per attempt |
-| `verify` | invoke | run verification command; record evidence artifact + exit status |
-| `approve` | gate | current evidence + explicit human attribution at level 1 + expected revision |
-| `pin` | invoke + gate | constitution/protocol file hashes journaled; drift detected |
+A future level may place journal ownership and module execution behind operating-system
+permissions. That hardens the wall without changing the mission protocol.
 
-Everything else — routing judgment, supervision, compaction, briefing, when to interrupt the
-human, harness specifics — is Agent + Distro + files.
+## Evaluation
 
-## Eval doctrine (how intent is debugged)
+Intent has no compiler, so scenarios test both trajectory and outcome:
 
-Adopted from applied-AI evaluation practice
-([source](https://x.com/eyad_khrais/status/2074519552277336571)): an eval gives an agent a task
-and grades **outcome** and **trajectory** separately; deterministic checks catch safety
-violations, a judge model with a rubric scores quality; the grades are never blended.
+- **Governance:** deterministic pass/fail over the journal. A failure invalidates the eval or
+  release claim; runtime delivery is gated by current evidence and human approval.
+- **Mission quality:** whether the human received a good result. It is graded separately and
+  cannot be inflated by governance success.
 
-Applied to aOS:
+The journal is the durable trajectory. A distro change that preserves process execution but causes
+authority, evidence, or attention failures is still a regression.
 
-- **The journal is the trajectory.** Every governed action already leaves an ordered event trace.
-  Eval checks are queries over `events`.
-- **Two grades per scenario, reported separately:**
-  - *Governance grade* — deterministic checks against the journal (no `delivered` without
-    `approval.decided` naming evidence; no canonical worker mutation admitted under an expired
-    authority epoch, while its rejection and subsequent system reconciliation remain journalable;
-    no dispatch without an admit). Pass/fail; gates everything.
-  - *Mission grade* — did the work get done well. Deterministic fixture grading is allowed for
-    scripted early scenarios; real-agent quality is judge-graded, never agent-asserted.
-- **Evals are the only regression detector for the intent layer.** Prose has no compiler. Every
-  change to `AGENTS.md`, a skill, or a protocol file must rerun the scenario suite. A distro
-  change that tanks the governance grade is a bug even though nothing crashed.
-- **A judge model with a rubric grades liaison judgment** (escalation appropriateness, briefing
-  fidelity to journal state, work-order membrane integrity). This is the tooling for *misses*.
-- The same journal checks run on gated operations and explicit reconciliation/eval passes as the
-  level-1 violation detector — one substrate serving recovery, audit, gating, and evaluation.
+Evals are not constitutional merely because their checks are code. Scenario-specific rubrics and
+artifact checks belong with the eval; only demonstrated governance failures may ratchet into
+modules.
 
-## What aOS aims to do
+## Desired properties
 
-aOS preserves durable mission work across humans, harnesses, and machines. It does not replace
-harness memory. The durable surface is the distro, State Tree, and journal.
-
-1. **One human, many liaison sessions, many workers.** Every resident harness may enact liaison
-   behavior concurrently; no harness owns the liaison role.
-2. **Truth survives everything.** Compaction, window closure, harness switch, daemon death,
-   vendor outage — state, authority, and evidence reconstruct from journal and tree.
-3. **Authority is placed, not assumed.** Humans authorize and approve; the liaison proposes and
-   supervises; workers execute inside a membrane (worktree + work order).
-4. **Delivery requires evidence.** Claims are not evidence.
-5. **Legible at every altitude.** `ls` a mission and understand it; watch renders current work; the
-   journal explains every decision with provenance.
-6. **Misses are first-class.** Learning missions, journaled gate rejections, and hash-pins are the
-   stack traces of the intent layer.
-7. **Portable by cloning.** The distro is the install.
+1. One human can direct many concurrent liaison sessions and workers.
+2. Mission truth survives compaction, closed windows, stopped processes, harness changes, vendor
+   outages, and machine changes.
+3. Authority is placed rather than assumed: humans authorize and approve; agents supervise;
+   workers execute within scoped work orders.
+4. Claims do not substitute for current immutable passing evidence bound to the authorized scope
+   and exact candidate.
+5. A human or fresh agent can see what is running, blocked, decided, verified, and approvable.
+6. Routine work stays agent-managed; scarce human attention goes to consequential decisions,
+   material risk, budget pressure, non-convergence, and approval.
+7. The distro and durable state are portable by cloning and export.
 
 ## Non-goals
 
-- Being a framework: no module ever owns the orchestration loop.
-- Being all-markdown: contested state is atomic and journaled, not prose.
-- Enforcing beyond the assurance level: cooperative guardrails are labeled as such.
-- Managing model context windows: aOS curates artifacts; harnesses manage their own windows.
-- Competing on model quality: aOS governs work; it does not do the work.
-- Being a full agent memory system: aOS preserves missions, authority, evidence, and decisions; it
-  does not replicate harness chat history or personal memory stores.
-- ADR 0001's internal actor/mailbox/context engine in Python: kept as analysis of the multi-session
-  problem; not implemented on this substrate decision.
+- Owning an orchestration loop, scheduler, or background supervisor.
+- Choosing mission goals or competing on model quality.
+- Encoding all workflow in Python or all contested truth in Markdown.
+- Managing harness context windows or acting as a general personal-memory system.
+- Claiming stronger enforcement than the current assurance level.
+- Preserving disposable learning artifacts or historical implementation machinery in the active
+  interface.
 
-## The test that keeps it honest
+## Honest test
 
-Delete every agent session, kill every process, and hand the directory to a fresh harness on a
-different machine. If the new liaison can answer from the journal and State Tree alone — *what is
-running, what is blocked, what was decided and why, what is verified, what may be approved* —
-continue through the distro, and no canonical transition was applied without a journaled admit,
-aOS is working. Anything in the codebase that does not serve that test is suspect.
+Discard every harness conversation, stop every process, and hand a clean clone plus durable
+mission state to a fresh harness on another machine.
 
-## Migration posture from 0.1
-
-0.1 is not discarded; it is re-homed:
-
-- **Port:** event ordering, lease atomicity, scoped token hashing, durable identities/hashes,
-  verifier-failure blocking, retry identities, and worktree isolation (`aos/store.py`, parts of
-  `aos/control.py`) → constitutional modules. Replace caller-supplied transition edges with a
-  protocol-owned closed graph; strengthen checkpoint-shaped evidence into immutable evidence-bound
-  approval.
-- **Demote to distro intent:** orchestration flow, routing judgment, retry policy, briefing logic
-  (most of `aos/control.py`, `aos/cli.py` prose behavior, `AGENTS.md` protocol).
-- **Replace:** CLI-as-privileged-API → thin toolbelt invoking modules; daemon supervision →
-  concurrent resident liaison sessions guided by protocols, with revision-checked operations and
-  module-enforced worker capabilities.
-- **Delete only after** the eval suite passes against the new substrate.
+If it can determine what is running, blocked, decided and why, verified, and approvable; continue
+through the distro; and no canonical contested transition was applied without a journaled
+admission while every rejection remained durable, aOS is working. Anything that does not
+materially serve that test is suspect.

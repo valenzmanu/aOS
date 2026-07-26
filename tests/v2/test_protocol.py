@@ -449,6 +449,23 @@ def process_recovery() -> ProcessRecovery:
     )
 
 
+def test_running_process_reset_requires_typed_session_recovery() -> None:
+    require_transition(
+        AggregateType.PROCESS,
+        ProcessState.RUNNING,
+        ProcessState.CREATED,
+        context=process_recovery(),
+    )
+
+    with pytest.raises(ProtocolViolation, match="requires ProcessRecovery context"):
+        require_transition(
+            AggregateType.PROCESS,
+            ProcessState.RUNNING,
+            ProcessState.CREATED,
+            context=object(),
+        )
+
+
 @pytest.mark.parametrize("source", (ProcessState.FAILED, ProcessState.ORPHANED))
 def test_terminal_process_can_only_reset_for_session_retry_with_new_epoch(
     source: ProcessState,

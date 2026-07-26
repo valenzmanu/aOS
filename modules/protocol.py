@@ -324,7 +324,9 @@ _MISSION_EDGES = {
 
 _PROCESS_EDGES = {
     "created": frozenset({"running", "failed", "cancelled", "orphaned"}),
-    "running": frozenset({"paused", "blocked", "completed", "failed", "cancelled", "orphaned"}),
+    "running": frozenset(
+        {"created", "paused", "blocked", "completed", "failed", "cancelled", "orphaned"}
+    ),
     "paused": frozenset({"running", "cancelled", "orphaned"}),
     "blocked": frozenset({"running", "failed", "cancelled", "orphaned"}),
     "failed": frozenset({"created"}),
@@ -373,6 +375,7 @@ _CONTEXTUAL_EDGES: Final = frozenset(
         (AggregateType.MISSION, "verifying", "non_convergent"),
         (AggregateType.PROCESS, "failed", "created"),
         (AggregateType.PROCESS, "orphaned", "created"),
+        (AggregateType.PROCESS, "running", "created"),
         (AggregateType.ATTEMPT, "orphaned", "active"),
         (AggregateType.ATTEMPT, "completed", "active"),
     }

@@ -1,6 +1,0 @@
-{
-  "schema_version": 1,
-  "decision": "authorized",
-  "human_principal": "human:learning",
-  "decision_source_hash": "REPLACE_WITH_64_CHAR_HEX_DIGEST_OF_DECISION_SOURCE"
-}
