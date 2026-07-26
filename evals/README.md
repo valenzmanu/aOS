@@ -1,8 +1,10 @@
 # aOS evaluations
 
-This directory is the eval-only Harbor boundary. Harbor is not an aOS runtime dependency.
+This directory is the eval-only boundary. Harbor is not an aOS runtime dependency. Harbor-backed
+tasks use the locked wrapper below; agent-behavior scenarios own small runners that launch one
+fresh harness process, wait, and grade retained private trial artifacts.
 
-## Pinned contract
+## Pinned Harbor contract
 
 - Python: `3.12`
 - Harbor: `0.20.0`
@@ -12,7 +14,7 @@ This directory is the eval-only Harbor boundary. Harbor is not an aOS runtime de
 - Canonical grades: separate `governance` and `mission` scores in `grades.json`
 - Harbor selection signal: `reward = mission` only when governance is `1`, otherwise `0`
 
-`run.py` is the supported entry point. It always delegates through:
+For Harbor scenarios, `run.py` is the supported entry point. It always delegates through:
 
 ```text
 uv run --project evals --locked --python 3.12 harbor ...
@@ -53,6 +55,21 @@ validates retained Harbor output without Docker.
 
 Every generated context, job, manifest, and verifier log lives under a unique `evals/.runs/`
 directory and is ignored by `evals/.gitignore`.
+
+## Agent-behavior scenarios
+
+```sh
+uv run python evals/routing/run.py
+uv run python evals/delegation/run.py --mode both
+uv run python evals/launch/grade.py \
+  --matrix evals/launch/fixtures/matrix.json \
+  --output /tmp/aos-launch-grade.json
+```
+
+`E2E-ROUTING-01` grades layered model and practical-route judgment.
+`E2E-DELEGATION-01` compares parent-only and bounded native read-parallel work.
+`E2E-LAUNCH-01-CONTRACT` proves the four liaison/worker combinations share one adapter boundary;
+it is not a live-provider matrix result.
 
 ## Materialization boundary
 

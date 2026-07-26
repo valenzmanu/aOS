@@ -36,6 +36,19 @@ operation orphans the stalled session, closes its authority, resets the same pro
 order, worktree, and partial work remain in place. Agents still diagnose the stall and decide
 whether to recover; aOS adds no monitor or orchestration loop.
 
+The current real-worker learning slice adds agent-authored layered routing, thin Codex and Cursor
+launch adapters, and bounded native delegation. The liaison first ranks models for task fit, then
+ranks eligible model/harness/billing routes from current observations. Either liaison harness can
+select either worker adapter; billing belongs to the selected worker route. Both adapters have a
+passing [direct live calibration](docs/evidence/2026-07-26-live-worker-adapter-calibration.md).
+
+Three paired Codex calibration runs confirmed that native read-only children preserve parent
+context and exact synthesis, but were inefficient for a tiny three-lane task. Median native
+execution was 60.185 seconds and 226,680 input tokens versus 34.618 seconds and 116,819 without
+delegation. Therefore delegation is not a default speed optimization; the worker must judge that
+independent work is large enough to amortize orchestration. See the
+[dated calibration evidence](docs/evidence/2026-07-26-codex-delegation-calibration.md).
+
 ## Proven foundation
 
 `E2E-00` starts a fresh Codex agent resident in a prepared aOS root with only the checked-in
@@ -58,16 +71,24 @@ Run it with an authenticated Codex CLI:
 uv sync --extra dev
 uv run python evals/v0/run.py
 uv run python evals/recovery/run.py
+uv run python evals/routing/run.py
+uv run python evals/delegation/run.py --mode both
 ```
 
-The current tracer is deliberately narrow: one mission, one deterministic worker fixture, and two
-scripted human decisions. Generic verification, real worker adapters, multi-mission operation,
+The permanent tracer remains deliberately narrow: one mission, one deterministic worker fixture,
+and two scripted human decisions. The routing and delegation scenarios are learning evals, not a
+new orchestration runtime. Live Cursor comparisons, generic verification, multi-mission operation,
 and the general distro remain later milestones.
 
 ## Repository
 
 ```text
 modules/       deterministic constitutional joints
+protocols/     portable agent routing and native-delegation guidance
+distro/skills/ thin Codex and Cursor discovery/launch adapters
+evals/routing/ agent-authored layered route-choice proof
+evals/launch/  deterministic four-cell cross-harness contract
+evals/delegation/ paired parent-only/native-delegation proof
 evals/recovery/ agent-driven stalled-worker recovery proof
 evals/v0/      permanent agent-runtime vertical tracer
 tests/v2/      governance, protocol, migration, and tracer tests

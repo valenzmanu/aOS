@@ -97,6 +97,11 @@ Landed:
   its process from `running` to `created`, and creates a fresh session and authority epoch without
   changing the attempt, process, work order, or worktree;
 - removal of the legacy Python orchestration runtime.
+- portable agent-authored routing and native-delegation protocols;
+- thin, credential-filtering Codex and Cursor worker adapters;
+- a passing layered-routing agent eval and deterministic four-cell launch contract; and
+- three passing paired Codex delegation calibrations whose measured overhead keeps native
+  delegation opt-in rather than default.
 
 The learning mission exposed reusable failures:
 
@@ -132,8 +137,11 @@ honestly at `verifying`: general task-owned evidence admission remains the next 
 
 1. **Readable mission state.** A fresh agent can answer: what is running, what is blocked, what
    was decided and why, what is verified, and what may be approved.
-2. **Real workers.** Exercise interactive and long-running work through at least two harness
-   adapters without moving routing or supervision into Python.
+2. **Real workers.** Continue the
+   [agent routing and native delegation plan](agent-routing-and-delegation-plan.md): run the live
+   cross-harness cells and repeated Codex/Cursor comparisons, then retain only routing priors and
+   delegation guidance supported by compatible trials. Routing and supervision remain agent
+   judgment rather than Python workflow.
 3. **Portable continuation.** Give a clean clone plus exported durable state to a fresh harness on
    another machine and continue without prior conversation state.
 

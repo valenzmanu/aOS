@@ -14,6 +14,12 @@ Read `docs/adr/0002-sparse-constitutional-agent-os.md` and
 - Perform ordinary repository work directly. Do not turn source edits into governed missions.
 - Keep goals, planning, routing, supervision, recovery, and retry judgment in agents—not
   `modules/`.
+- Before dispatching a real worker, read `protocols/routing.md`, observe current harness offers
+  with the matching `distro/skills/launch-*-worker` adapter, and author the route decision. The
+  liaison harness never constrains the worker harness or billing route.
+- Inside an admitted Worker Process, use native subagents only within
+  `protocols/delegation.md`: bounded depth and child count, inherited scope and aggregate budget,
+  and one parent-integrated result. For small or tightly coupled tasks, keep work in the parent.
 - Preserve `E2E-00`: after launching the agent, its runner waits and grades.
 - Run `uv run pytest` and `uv run ruff check .`.
 

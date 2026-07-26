@@ -1,0 +1,61 @@
+{
+  "cells": [
+    {
+      "adapter_skill": "launch-codex-worker",
+      "billing_owner": "worker_route",
+      "liaison_harness": "codex",
+      "lifecycle": [
+        "admitted_route",
+        "adapter_launch",
+        "normalized_observation"
+      ],
+      "worker_harness": "codex"
+    },
+    {
+      "adapter_skill": "launch-cursor-worker",
+      "billing_owner": "worker_route",
+      "liaison_harness": "codex",
+      "lifecycle": [
+        "admitted_route",
+        "adapter_launch",
+        "normalized_observation"
+      ],
+      "worker_harness": "cursor"
+    },
+    {
+      "adapter_skill": "launch-codex-worker",
+      "billing_owner": "worker_route",
+      "liaison_harness": "cursor",
+      "lifecycle": [
+        "admitted_route",
+        "adapter_launch",
+        "normalized_observation"
+      ],
+      "worker_harness": "codex"
+    },
+    {
+      "adapter_skill": "launch-cursor-worker",
+      "billing_owner": "worker_route",
+      "liaison_harness": "cursor",
+      "lifecycle": [
+        "admitted_route",
+        "adapter_launch",
+        "normalized_observation"
+      ],
+      "worker_harness": "cursor"
+    }
+  ],
+  "normalized_observation_fields": [
+    "billing_channel",
+    "billing_channel_source",
+    "exit_status",
+    "harness",
+    "model",
+    "reasoning_effort",
+    "schema_version",
+    "session_handle",
+    "usage",
+    "version"
+  ],
+  "schema_version": 1
+}
