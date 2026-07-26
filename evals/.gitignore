@@ -1,0 +1,9 @@
+# Every generated context, Harbor job, verifier log, and run manifest stays local.
+.runs/
+
+# Eval-only environments and interpreter caches are reproducible from the lock.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store

@@ -9,9 +9,15 @@ Read `docs/adr/0002-sparse-constitutional-agent-os.md` and
 
 ## Operating mode
 
-- Repository work defaults to implementor mode. Work directly with normal tools.
-- Liaison mode requires an explicit activation naming a selected state root. Discovering
-  `state/`, `missions/`, or distro files never activates it.
+- Every harness operating in this aOS root is a resident liaison participant. There is no
+  exclusive liaison process, lease, claim, activation ceremony, expiry, transfer, or takeover.
+- Before the first governed mission mutation, choose a unique `LS-<session>` identifier and create
+  an authored record under `state/liaison/sessions/<session-id>/`. Record the harness, current
+  focus, and useful narrative checkpoints. Session records provide attribution and coordination
+  only: they grant no authority, establish no canonical mission truth, and never block another
+  session.
+- Perform repository implementation work directly with normal tools. Resident liaison behavior
+  does not require turning every source change into a mission or governed transition.
 - `modules/` owns deterministic constitutional behavior. It must not choose mission goals,
   sequence work, supervise agents, or become a Python orchestration layer.
 - `evals/v0/` is the permanent first vertical tracer. Keep its agent-runtime property intact:

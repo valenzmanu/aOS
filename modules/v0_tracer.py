@@ -32,12 +32,6 @@ from modules.journal import (
     initialize_root,
     utc_now,
 )
-from modules.lease import (
-    LIAISON_SCOPE,
-    LiaisonClaimRequest,
-    capability_digest,
-    claim_liaison,
-)
 from modules.protocol import (
     AggregateType,
     AttemptState,
@@ -49,8 +43,7 @@ from modules.protocol import (
     validate_evidence_record,
 )
 
-V0_LIAISON_ID = "liaison:v0"
-V0_EPOCH_ID = "AE-V0"
+V0_LIAISON_SESSION_ID = "LS-V0"
 V0_ATTEMPT_ID = "A-V0"
 V0_PROCESS_ID = "P-V0"
 V0_WORK_ORDER_ID = "W-V0"
@@ -455,57 +448,6 @@ def seed_mission(
     return outcome
 
 
-def claim_v0(
-    root: Path,
-    *,
-    operation_id: str,
-    epoch_id: str,
-    token: str,
-    clock: Callable[[], datetime] = utc_now,
-) -> dict[str, object]:
-    outcome = claim_liaison(
-        root,
-        LiaisonClaimRequest(
-            operation_id=operation_id,
-            candidate_id=V0_LIAISON_ID,
-            epoch_id=epoch_id,
-            expected_epoch_revision=0,
-            ttl_seconds=3600,
-        ),
-        token=token,
-        clock=clock,
-    )
-    return asdict(outcome)
-
-
-def _liaison_rejection(
-    context: _ValidationContext,
-    *,
-    epoch_id: str,
-    token: str,
-    extra: Callable[[_ValidationContext], GateRejection | None] | None = None,
-) -> GateRejection | None:
-    row = context.db.execute(
-        """
-        SELECT subject_id, scope, token_hash
-        FROM authority_epochs
-        WHERE epoch_id=? AND kind='liaison' AND status='active'
-        """,
-        (epoch_id,),
-    ).fetchone()
-    if row is None:
-        return GateRejection("liaison_epoch_missing", {"epoch_id": epoch_id})
-    observed = capability_digest(
-        token,
-        kind="liaison",
-        subject_id=str(row[0]),
-        scope=str(row[1]),
-    )
-    if str(row[0]) != V0_LIAISON_ID or str(row[1]) != LIAISON_SCOPE or str(row[2]) != observed:
-        return GateRejection("liaison_capability_invalid", {"epoch_id": epoch_id})
-    return None if extra is None else extra(context)
-
-
 def _mission_state_rejection(
     context: _ValidationContext,
     *,
@@ -539,8 +481,7 @@ def _liaison_operation(
     *,
     operation_id: str,
     action: str,
-    epoch_id: str,
-    token: str,
+    liaison_session_id: str,
     expected_revisions: tuple[ExpectedRevision, ...],
     payload: dict[str, object],
     validator: Callable[[_ValidationContext], GateRejection | None],
@@ -554,8 +495,7 @@ def _liaison_operation(
         action=action,
         invoker=Invoker(
             kind="liaison",
-            id=V0_LIAISON_ID,
-            authority_epoch_id=epoch_id,
+            id=liaison_session_id,
             on_behalf_of=on_behalf_of,
             decision_source_hash=decision_hash,
         ),
@@ -565,12 +505,7 @@ def _liaison_operation(
     return _run_governed(
         root,
         request,
-        validator=lambda context: _liaison_rejection(
-            context,
-            epoch_id=epoch_id,
-            token=token,
-            extra=validator,
-        ),
+        validator=validator,
         projector=projector,
         clock=clock,
     )
@@ -583,8 +518,7 @@ def authorize_mission(
     *,
     operation_id: str,
     expected_revision: int,
-    epoch_id: str,
-    token: str,
+    liaison_session_id: str,
     decision_path: Path,
     clock: Callable[[], datetime] = utc_now,
 ) -> OperationOutcome:
@@ -667,8 +601,7 @@ def authorize_mission(
         root,
         operation_id=operation_id,
         action="v0.mission_authorize",
-        epoch_id=epoch_id,
-        token=token,
+        liaison_session_id=liaison_session_id,
         expected_revisions=targets,
         payload={"decision_source_hash": decision_hash, "mission_id": mission_id},
         validator=validator,
@@ -688,8 +621,7 @@ def dispatch_mission(
     *,
     operation_id: str,
     expected_revision: int,
-    epoch_id: str,
-    token: str,
+    liaison_session_id: str,
     clock: Callable[[], datetime] = utc_now,
 ) -> OperationOutcome:
     with sqlite3.connect(Path(root).resolve() / "aos.db") as db:
@@ -825,8 +757,7 @@ def dispatch_mission(
         root,
         operation_id=operation_id,
         action="v0.mission_dispatch",
-        epoch_id=epoch_id,
-        token=token,
+        liaison_session_id=liaison_session_id,
         expected_revisions=targets,
         payload={
             "contract_hash": contract_hash,
@@ -849,8 +780,7 @@ def _transition_runtime(
     *,
     operation_id: str,
     expected_revision: int,
-    epoch_id: str,
-    token: str,
+    liaison_session_id: str,
     phase: str,
     receipt_path: Path | None = None,
     clock: Callable[[], datetime] = utc_now,
@@ -993,8 +923,7 @@ def _transition_runtime(
         root,
         operation_id=operation_id,
         action=f"v0.mission_{phase}",
-        epoch_id=epoch_id,
-        token=token,
+        liaison_session_id=liaison_session_id,
         expected_revisions=targets,
         payload={
             "mission_id": mission_id,
@@ -1017,8 +946,7 @@ def verify_mission(
     *,
     operation_id: str,
     expected_revision: int,
-    epoch_id: str,
-    token: str,
+    liaison_session_id: str,
     clock: Callable[[], datetime] = utc_now,
 ) -> OperationOutcome:
     output_path = (
@@ -1141,8 +1069,7 @@ def verify_mission(
         root,
         operation_id=operation_id,
         action="v0.mission_verify",
-        epoch_id=epoch_id,
-        token=token,
+        liaison_session_id=liaison_session_id,
         expected_revisions=targets,
         payload={
             "mission_id": mission_id,
@@ -1165,8 +1092,7 @@ def decide_mission(
     *,
     operation_id: str,
     expected_revision: int,
-    epoch_id: str,
-    token: str,
+    liaison_session_id: str,
     decision_path: Path,
     clock: Callable[[], datetime] = utc_now,
 ) -> OperationOutcome:
@@ -1305,8 +1231,7 @@ def decide_mission(
         root,
         operation_id=operation_id,
         action="v0.mission_decide",
-        epoch_id=epoch_id,
-        token=token,
+        liaison_session_id=liaison_session_id,
         expected_revisions=targets,
         payload={
             "decision_source_hash": decision_hash,
@@ -1331,11 +1256,11 @@ def _root_from_env(value: str | None, environment_name: str) -> Path:
     return Path(selected)
 
 
-def _token_from_env() -> str:
-    token = os.environ.get("AOS_LIAISON_TOKEN")
-    if not token:
-        raise InvalidOperation("AOS_LIAISON_TOKEN is required")
-    return token
+def _liaison_session_from_env(value: str | None) -> str:
+    session_id = value or os.environ.get("AOS_LIAISON_SESSION_ID")
+    if not session_id:
+        raise InvalidOperation("AOS_LIAISON_SESSION_ID is required")
+    return session_id
 
 
 def _outcome_json(outcome: OperationOutcome | dict[str, object]) -> dict[str, object]:
@@ -1383,6 +1308,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="aos-v0")
     parser.add_argument("--state-root")
     parser.add_argument("--missions-root")
+    parser.add_argument("--liaison-session")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init = subparsers.add_parser("init")
@@ -1396,16 +1322,11 @@ def _parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status")
     status.add_argument("mission_id", nargs="?", default="M-V0")
 
-    claim = subparsers.add_parser("claim")
-    claim.add_argument("--op", default="OP-V0-CLAIM")
-    claim.add_argument("--epoch", default=V0_EPOCH_ID)
-
     for name in ("authorize", "dispatch", "start", "finish", "verify", "decide"):
         command = subparsers.add_parser(name)
         command.add_argument("mission_id")
         command.add_argument("--op", required=True)
         command.add_argument("--expect", required=True, type=int)
-        command.add_argument("--epoch", default=V0_EPOCH_ID)
         if name in {"authorize", "decide"}:
             command.add_argument("--decision", required=True)
         elif name == "finish":
@@ -1437,13 +1358,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "status":
             result = _render_state_tree(root, missions_root, args.mission_id)
-        elif args.command == "claim":
-            result = claim_v0(
-                root,
-                operation_id=args.op,
-                epoch_id=args.epoch,
-                token=_token_from_env(),
-            )
         elif args.command == "authorize":
             result = _with_mission_summary(
                 _outcome_json(
@@ -1453,8 +1367,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.mission_id,
                         operation_id=args.op,
                         expected_revision=args.expect,
-                        epoch_id=args.epoch,
-                        token=_token_from_env(),
+                        liaison_session_id=_liaison_session_from_env(args.liaison_session),
                         decision_path=Path(args.decision),
                     )
                 ),
@@ -1470,8 +1383,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.mission_id,
                         operation_id=args.op,
                         expected_revision=args.expect,
-                        epoch_id=args.epoch,
-                        token=_token_from_env(),
+                        liaison_session_id=_liaison_session_from_env(args.liaison_session),
                     )
                 ),
                 root,
@@ -1486,8 +1398,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.mission_id,
                         operation_id=args.op,
                         expected_revision=args.expect,
-                        epoch_id=args.epoch,
-                        token=_token_from_env(),
+                        liaison_session_id=_liaison_session_from_env(args.liaison_session),
                         phase=args.command,
                         receipt_path=(Path(args.receipt) if args.command == "finish" else None),
                     )
@@ -1504,8 +1415,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.mission_id,
                         operation_id=args.op,
                         expected_revision=args.expect,
-                        epoch_id=args.epoch,
-                        token=_token_from_env(),
+                        liaison_session_id=_liaison_session_from_env(args.liaison_session),
                     )
                 ),
                 root,
@@ -1520,8 +1430,7 @@ def main(argv: list[str] | None = None) -> int:
                         args.mission_id,
                         operation_id=args.op,
                         expected_revision=args.expect,
-                        epoch_id=args.epoch,
-                        token=_token_from_env(),
+                        liaison_session_id=_liaison_session_from_env(args.liaison_session),
                         decision_path=Path(args.decision),
                     )
                 ),

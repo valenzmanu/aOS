@@ -3,7 +3,7 @@ status: accepted
 date: 2026-07-22
 decision_owners: aOS maintainers
 supersedes-direction-of: historical 0.1 plan at e920ff2:docs/aos-poc-plan.md
-related: ADR 0001 (unmerged analysis; kept as analysis, not roadmap)
+related: ADR 0001 (unmerged analysis; multi-session liaison direction incorporated here)
 ---
 
 # Sparse Constitutional Agent OS (SCAOS)
@@ -66,6 +66,33 @@ evidence, or protocol — and nowhere else.
 | **Distro** | `AGENTS.md`, `protocols/`, `skills/` | Portable intent. Instantiates a general agent as liaison, worker, or verifier. Constitution files are hash-pinned in the journal so drift is detectable. |
 | **Agents** | Any harness: Cursor, Codex, CLI, future | The runtime. Non-deterministic by design. Replaceable without loss of state. |
 
+## Resident liaison behavior
+
+The liaison is not an object, process, daemon, lease holder, or exclusive capability. It is the
+root-scoped operating behavior of agent harnesses resident in an aOS root. Reading that root's
+`AGENTS.md` is sufficient to enter liaison behavior; discovering a separate state root or claiming
+global ownership is not required. Any number of harness sessions may act concurrently.
+
+Before its first governed mission mutation, each harness authors a unique record under
+`state/liaison/sessions/`. These records provide attribution, focus, observations, and narrative
+checkpoints. They are not canonical authority, never block another session, and may remain stale
+after a terminal or harness disappears. The journal identifies each liaison mutation by its
+session ID. Expected aggregate revisions, operation IDs, canonical request hashes, and external
+effect intents resolve actual conflicts at the narrowest contested boundary. Session attribution
+is excluded from the semantic request hash so another resident session can safely replay an
+identical operation after a crash; the original admitting session remains in the event envelope.
+
+This makes the role resilient by construction: a forgotten terminal or orphan process owns
+nothing that must expire, transfer, release, or be taken over. Human authorization and approval
+remain explicit attributed decisions, and scoped worker/process capabilities remain expiring
+authority epochs. At assurance level 1, resident liaison attribution remains cooperative rather
+than authentication against a hostile local process.
+
+The cutover is additive at schema 4 because event envelopes already permit an absent authority
+epoch. Historical active liaison-epoch rows are inert under the new admission path and may be
+closed by the replay-safe `journal.retire_liaison_authority` maintenance operation. Their cleanup
+never gates a resident session and does not rewrite their original events.
+
 ## Two attachment modes
 
 Deterministic modules attach to the system in exactly two ways:
@@ -73,7 +100,7 @@ Deterministic modules attach to the system in exactly two ways:
 - **Invoke** — an agent calls a module for mechanics it should not freestyle: worktree creation,
   journal append, verification runs.
 - **Gate** — a module admits or rejects a proposed transition: authorize, dispatch, approve,
-  retry-level, lease claim. Rejections are journaled.
+  retry-level, or worker authority delegation. Rejections are journaled.
 
 Decision procedure for every feature:
 
@@ -106,7 +133,7 @@ is now normative.
 ## The ratchet rule
 
 A new deterministic module, a new gate, or an expansion of an existing module's authority may be
-added **only** with a demonstrated freestyle failure — an incident, a failed dogfood scenario, or
+added **only** with a demonstrated freestyle failure — an incident, a failed learning mission, or
 an acceptance test proving agents cannot be trusted with that transition. Workflow convenience is
 never sufficient grounds. Pure utilities, harness adapters, renderers, and eval checks do not
 become constitutional merely because they are code. This is the constitutional amendment process;
@@ -116,7 +143,7 @@ it is deliberately annoying. Without it, "sparse" erodes back into a framework.
 
 | Module | Attach | Guarantees |
 | --- | --- | --- |
-| `lease` | invoke + gate | singleton liaison; scoped, expiring process authority |
+| `lease` | invoke + gate | scoped, expiring worker/process authority |
 | `journal` | invoke | append-only event log; atomic append + projection update |
 | `protocol` | gate | legal mission/process FSM transitions only |
 | `authz` | gate | capability checks on privileged transitions |
@@ -156,16 +183,19 @@ Applied to aOS:
 
 ## What aOS aims to do
 
-1. **One human, one conversation, many workers.** Any harness can be the liaison; none *is* the
-   liaison.
+aOS preserves durable mission work across humans, harnesses, and machines. It does not replace
+harness memory. The durable surface is the distro, State Tree, and journal.
+
+1. **One human, many liaison sessions, many workers.** Every resident harness may enact liaison
+   behavior concurrently; no harness owns the liaison role.
 2. **Truth survives everything.** Compaction, window closure, harness switch, daemon death,
    vendor outage — state, authority, and evidence reconstruct from journal and tree.
 3. **Authority is placed, not assumed.** Humans authorize and approve; the liaison proposes and
    supervises; workers execute inside a membrane (worktree + work order).
 4. **Delivery requires evidence.** Claims are not evidence.
-5. **Legible at every altitude.** `ls` a mission and understand it; watch renders the fleet; the
+5. **Legible at every altitude.** `ls` a mission and understand it; watch renders current work; the
    journal explains every decision with provenance.
-6. **Misses are first-class.** Dogfood scenarios, journaled gate rejections, and hash-pins are the
+6. **Misses are first-class.** Learning missions, journaled gate rejections, and hash-pins are the
    stack traces of the intent layer.
 7. **Portable by cloning.** The distro is the install.
 
@@ -176,16 +206,18 @@ Applied to aOS:
 - Enforcing beyond the assurance level: cooperative guardrails are labeled as such.
 - Managing model context windows: aOS curates artifacts; harnesses manage their own windows.
 - Competing on model quality: aOS governs work; it does not do the work.
+- Being a full agent memory system: aOS preserves missions, authority, evidence, and decisions; it
+  does not replicate harness chat history or personal memory stores.
 - ADR 0001's internal actor/mailbox/context engine in Python: kept as analysis of the multi-session
   problem; not implemented on this substrate decision.
 
 ## The test that keeps it honest
 
 Delete every agent session, kill every process, and hand the directory to a fresh harness on a
-different machine. If the new liaison can answer — *what is running, what is blocked, what was
-decided and why, what is verified, what may be approved* — and no canonical transition was applied
-without a journaled admit, aOS is working. Anything in the codebase that does not serve that test
-is suspect.
+different machine. If the new liaison can answer from the journal and State Tree alone — *what is
+running, what is blocked, what was decided and why, what is verified, what may be approved* —
+continue through the distro, and no canonical transition was applied without a journaled admit,
+aOS is working. Anything in the codebase that does not serve that test is suspect.
 
 ## Migration posture from 0.1
 
@@ -199,5 +231,6 @@ is suspect.
 - **Demote to distro intent:** orchestration flow, routing judgment, retry policy, briefing logic
   (most of `aos/control.py`, `aos/cli.py` prose behavior, `AGENTS.md` protocol).
 - **Replace:** CLI-as-privileged-API → thin toolbelt invoking modules; daemon supervision →
-  liaison supervision guided by protocols, with module-enforced leases.
+  concurrent resident liaison sessions guided by protocols, with revision-checked operations and
+  module-enforced worker capabilities.
 - **Delete only after** the eval suite passes against the new substrate.

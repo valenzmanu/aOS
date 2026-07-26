@@ -3,6 +3,21 @@
 All notable changes to aOS are documented here. The project follows semantic versioning after the
 initial alpha series.
 
+## Unreleased
+
+- replaced exclusive liaison leases with resident, non-exclusive harness sessions
+- made `AGENTS.md` residence sufficient for liaison behavior without activation or takeover
+- attributed liaison operations to `LS-*` session IDs while retaining revision and idempotency
+  gates
+- allowed identical governed operations to replay safely across resident liaison sessions
+- retained scoped, expiring capability epochs only for delegated worker/process authority
+- added replay-safe retirement of historical liaison epochs and concurrency/orphan-tolerance tests
+- cut the permanent `E2E-00` tracer over from liaison tokens and claims to authored session records
+- reframed the v2 roadmap in plain aOS language: mission controls, readable project state,
+  new-agent continuation, and real workers (stable milestone IDs retained in parentheses)
+- added landing-page learning mission and thin `aos-mission` controls
+  (intake → evaluable contract → authorize) driven by vague human requests
+
 ## 0.2.0 — 2026-07-23
 
 - adopted the sparse constitutional agent-OS architecture

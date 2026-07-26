@@ -12,11 +12,15 @@ For `M-V0`, use this sequence and inspect the JSON after every command:
    uv run aos-v0 status
    ```
 
-2. Claim the singleton liaison authority:
+2. Record this resident harness session before the first mutation:
 
    ```sh
-   uv run aos-v0 claim --op OP-V0-CLAIM --epoch AE-V0
+   mkdir -p state/liaison/sessions/LS-V0
+   printf '%s\n' '# Liaison session LS-V0' '' 'Harness: Codex' 'Focus: M-V0' > state/liaison/sessions/LS-V0/session.md
    ```
+
+   This authored record provides attribution and coordination only. It grants no authority and
+   blocks no other session.
 
 3. Relay the scripted human authorization against revision 1:
 

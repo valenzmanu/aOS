@@ -40,7 +40,7 @@ SAFE_HOST_ENVIRONMENT = {
 
 
 class TrialError(RuntimeError):
-    """The trial infrastructure failed or leaked private capability material."""
+    """The trial infrastructure failed."""
 
 
 def _repository_root() -> Path:
@@ -84,7 +84,7 @@ def _materialize_trial(repository: Path, trial: Path) -> None:
         scenario / "distro" / "protocols" / "mission.md",
         trial / "protocols" / "mission.md",
     )
-    _copy_regular_file(scenario / "ACTIVATE.md", trial / "ACTIVATE.md")
+    _copy_regular_file(scenario / "TASK.md", trial / "TASK.md")
     _copy_regular_file(
         scenario / "fixtures" / "objective.md",
         trial / "eval-fixture" / "objective.md",
@@ -108,14 +108,14 @@ def _safe_environment(
     host_environment: Mapping[str, str],
     *,
     trial: Path,
-    liaison_token: str,
+    liaison_session_id: str,
 ) -> dict[str, str]:
     environment = {
         name: value for name, value in host_environment.items() if name in SAFE_HOST_ENVIRONMENT
     }
     environment.update(
         {
-            "AOS_LIAISON_TOKEN": liaison_token,
+            "AOS_LIAISON_SESSION_ID": liaison_session_id,
             "AOS_MISSIONS_ROOT": str(trial / "missions"),
             "AOS_STATE_ROOT": str(trial / "state"),
             "PYTHONUTF8": "1",
@@ -227,25 +227,6 @@ def _codex_command(executable: str, final_path: Path) -> list[str]:
     ]
 
 
-def _contains_token(content: bytes, liaison_token: str) -> bool:
-    return liaison_token.encode("utf-8") in content
-
-
-def _trial_contains_token(trial: Path, liaison_token: str) -> Path | None:
-    needle = liaison_token.encode("utf-8")
-    for path in sorted(trial.rglob("*")):
-        if path.is_symlink() or not path.is_file():
-            continue
-        overlap = b""
-        with path.open("rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                content = overlap + chunk
-                if needle in content:
-                    return path
-                overlap = content[-(len(needle) - 1) :]
-    return None
-
-
 def _write_bytes(path: Path, content: bytes) -> None:
     path.write_bytes(content)
     path.chmod(0o600)
@@ -283,11 +264,11 @@ def run_trial(
         (repository / "evals" / ".runs") if runs_root is None else runs_root.expanduser().resolve()
     )
     trial = _allocate_trial(selected_runs_root)
-    liaison_token = secrets.token_urlsafe(48)
+    liaison_session_id = "LS-V0"
     environment = _safe_environment(
         os.environ if host_environment is None else host_environment,
         trial=trial,
-        liaison_token=liaison_token,
+        liaison_session_id=liaison_session_id,
     )
 
     final_temporary: Path | None = None
@@ -295,8 +276,6 @@ def run_trial(
         _materialize_trial(repository, trial)
         executable, codex_version = _codex_binary_and_version()
         bootstrap = _run_bootstrap(trial, environment)
-        if _contains_token(bootstrap, liaison_token):
-            raise TrialError("private liaison capability appeared in bootstrap output")
         _write_bytes(trial / "bootstrap.jsonl", bootstrap)
 
         with tempfile.NamedTemporaryFile(
@@ -307,7 +286,7 @@ def run_trial(
             final_temporary = Path(stream.name)
 
         command = _codex_command(executable, final_temporary)
-        activation = (trial / "ACTIVATE.md").read_bytes()
+        objective = (trial / "TASK.md").read_bytes()
 
         # Constitutional handoff: after this process starts, the runner makes
         # no lifecycle calls.  Only the agent may invoke aos-v0.
@@ -315,25 +294,13 @@ def run_trial(
             command,
             cwd=trial,
             env=environment,
-            input=activation,
+            input=objective,
             capture_output=True,
             check=False,
         )
         trajectory = bytes(completed.stdout or b"")
         stderr = bytes(completed.stderr or b"")
         final = final_temporary.read_bytes() if final_temporary.is_file() else b""
-
-        leaked_path = _trial_contains_token(trial, liaison_token)
-        if (
-            _contains_token(trajectory, liaison_token)
-            or _contains_token(stderr, liaison_token)
-            or _contains_token(final, liaison_token)
-            or leaked_path is not None
-        ):
-            raise TrialError(
-                "private liaison capability appeared in trial output"
-                + ("" if leaked_path is None else f" ({leaked_path.relative_to(trial)})")
-            )
 
         trajectory_path = trial / "trajectory.jsonl"
         final_path = trial / "final.txt"
@@ -369,12 +336,6 @@ def run_trial(
         sys.stdout.buffer.write(graded.stdout or b"")
         sys.stderr.buffer.write(graded.stderr or b"")
         return trial, 0 if completed.returncode == 0 and graded.returncode == 0 else 1
-    except Exception:
-        # A leaked token must not survive in retained output or state.  The
-        # directory was allocated by this invocation and is safe to remove.
-        if _trial_contains_token(trial, liaison_token) is not None:
-            shutil.rmtree(trial)
-        raise
     finally:
         if final_temporary is not None:
             final_temporary.unlink(missing_ok=True)

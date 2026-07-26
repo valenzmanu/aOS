@@ -13,22 +13,29 @@ requires explicit human decisions. It does not decide what work to do or orchest
 ## Architecture
 
 - **Agents are the runtime.** Liaison and worker agents interpret objectives and choose actions.
+- **Liaison behavior is resident and non-exclusive.** Every harness in an aOS root may act as a
+  liaison participant; authored session records provide attribution without leases or ownership.
 - **The file tree is the interface.** Missions, contracts, attempts, work orders, sessions, and
   evidence are inspectable files.
 - **The journal is canonical.** SQLite records immutable events, revisions, admissions, authority
   epochs, evidence, and approvals.
 - **Code is sparse.** `modules/` implements only deterministic constitutional behavior.
-- **Activation is explicit.** Liaison mode requires a named state root; discovering files never
-  grants authority.
+- **Residence establishes liaison behavior.** Reading the root distro is sufficient; contested
+  changes still require revision-checked journal admission and explicit human provenance where
+  required.
 
 The architectural decision is [ADR 0002](docs/adr/0002-sparse-constitutional-agent-os.md). The
 remaining build sequence and assurance claims are in the
-[v2 implementation plan](docs/aos-v2-implementation-plan.md).
+[v2 implementation plan](docs/aos-v2-implementation-plan.md). aOS preserves durable mission work in
+the journal and State Tree; it does not replace harness memory. Build priority is mission controls,
+then readable project state, then proving a new agent can continue from saved state, then real
+workers.
 
 ## Proven foundation
 
-`E2E-00` starts a fresh Codex agent with only the checked-in distro, activation, objective, and
-scripted human decisions. After launch, the runner waits; the agent drives the lifecycle.
+`E2E-00` starts a fresh Codex agent resident in a prepared aOS root with only the checked-in
+distro, objective, and scripted human decisions. It records its session; after launch, the runner
+waits while the agent drives the lifecycle.
 
 The permanent tracer proves:
 

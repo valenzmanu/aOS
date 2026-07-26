@@ -40,6 +40,7 @@ def public_files() -> list[Path]:
 
 def main() -> int:
     findings: list[str] = []
+    inspected = 0
     for path in public_files():
         relative = path.relative_to(ROOT)
         if any(part in FORBIDDEN_PATH_PARTS for part in relative.parts):
@@ -47,9 +48,14 @@ def main() -> int:
             continue
         try:
             raw = path.read_bytes()
+        except FileNotFoundError:
+            # Cached paths can have an unstaged working-tree deletion. There is
+            # no current file to inspect, so leave the deletion undisturbed.
+            continue
         except OSError as exc:
             findings.append(f"cannot read {relative}: {exc}")
             continue
+        inspected += 1
         if b"\0" in raw or len(raw) > 2_000_000:
             continue
         text = raw.decode("utf-8", errors="replace")
@@ -61,7 +67,7 @@ def main() -> int:
         for finding in findings:
             print(f"- {finding}")
         return 1
-    print(f"Public-tree privacy check passed: {len(public_files())} files inspected.")
+    print(f"Public-tree privacy check passed: {inspected} files inspected.")
     return 0
 
 

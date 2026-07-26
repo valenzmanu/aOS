@@ -13,7 +13,6 @@ from modules.v0_tracer import (
     _result_is_rejected,
     _transition_runtime,
     authorize_mission,
-    claim_v0,
     decide_mission,
     dispatch_mission,
     initialize_v0,
@@ -23,7 +22,7 @@ from modules.v0_tracer import (
 )
 
 EXPECTED_RESULT = b"TYR v0 end-to-end mission completed.\n"
-TOKEN = "v0-test-liaison-capability-" + ("x" * 40)
+LIAISON_SESSION_ID = "LS-TEST-V0"
 
 
 def _write_decision(path: Path, decision: str, source_hash: str) -> None:
@@ -61,23 +60,13 @@ def _prepare_verified_mission(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
         == "completed"
     )
     assert (
-        claim_v0(
-            root,
-            operation_id="OP-V0-CLAIM",
-            epoch_id="AE-V0",
-            token=TOKEN,
-        )["status"]
-        == "completed"
-    )
-    assert (
         authorize_mission(
             root,
             missions_root,
             "M-V0",
             operation_id="OP-V0-AUTHORIZE",
             expected_revision=1,
-            epoch_id="AE-V0",
-            token=TOKEN,
+            liaison_session_id=LIAISON_SESSION_ID,
             decision_path=authorize,
         ).status
         == "completed"
@@ -89,8 +78,7 @@ def _prepare_verified_mission(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             "M-V0",
             operation_id="OP-V0-DISPATCH",
             expected_revision=2,
-            epoch_id="AE-V0",
-            token=TOKEN,
+            liaison_session_id=LIAISON_SESSION_ID,
         ).status
         == "completed"
     )
@@ -101,8 +89,7 @@ def _prepare_verified_mission(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             "M-V0",
             operation_id="OP-V0-START",
             expected_revision=3,
-            epoch_id="AE-V0",
-            token=TOKEN,
+            liaison_session_id=LIAISON_SESSION_ID,
             phase="start",
         ).status
         == "completed"
@@ -134,8 +121,7 @@ def _prepare_verified_mission(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             "M-V0",
             operation_id="OP-V0-FINISH",
             expected_revision=4,
-            epoch_id="AE-V0",
-            token=TOKEN,
+            liaison_session_id=LIAISON_SESSION_ID,
             phase="finish",
             receipt_path=receipt,
         ).status
@@ -148,8 +134,7 @@ def _prepare_verified_mission(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
             "M-V0",
             operation_id="OP-V0-VERIFY",
             expected_revision=5,
-            epoch_id="AE-V0",
-            token=TOKEN,
+            liaison_session_id=LIAISON_SESSION_ID,
         ).status
         == "completed"
     )
@@ -173,6 +158,11 @@ def test_verifier_is_pinned_and_has_no_caller_oracle() -> None:
         )
 
 
+def test_tracer_has_no_liaison_claim_command() -> None:
+    with pytest.raises(SystemExit):
+        _parser().parse_args(["claim"])
+
+
 def test_approval_rejects_mutated_output_and_replay_stays_rejected(tmp_path: Path) -> None:
     root, missions_root, approve, result = _prepare_verified_mission(tmp_path)
     result.write_text("mutated after verification\n")
@@ -183,8 +173,7 @@ def test_approval_rejects_mutated_output_and_replay_stays_rejected(tmp_path: Pat
         "M-V0",
         operation_id="OP-V0-DECIDE-MUTATED",
         expected_revision=6,
-        epoch_id="AE-V0",
-        token=TOKEN,
+        liaison_session_id=LIAISON_SESSION_ID,
         decision_path=approve,
     )
     assert rejected.status == "rejected"
@@ -196,8 +185,7 @@ def test_approval_rejects_mutated_output_and_replay_stays_rejected(tmp_path: Pat
         "M-V0",
         operation_id="OP-V0-DECIDE-MUTATED",
         expected_revision=6,
-        epoch_id="AE-V0",
-        token=TOKEN,
+        liaison_session_id=LIAISON_SESSION_ID,
         decision_path=approve,
     )
     replay_json = _outcome_json(replayed)
@@ -213,8 +201,7 @@ def test_approval_rejects_mutated_output_and_replay_stays_rejected(tmp_path: Pat
         "M-V0",
         operation_id="OP-V0-DECIDE-CLEAN",
         expected_revision=6,
-        epoch_id="AE-V0",
-        token=TOKEN,
+        liaison_session_id=LIAISON_SESSION_ID,
         decision_path=approve,
     )
     assert approved.status == "completed"

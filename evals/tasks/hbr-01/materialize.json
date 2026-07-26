@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "task_files": [
+    "environment/Dockerfile",
+    "instruction.md",
+    "solution/solve.sh",
+    "task.toml",
+    "tests/Dockerfile",
+    "tests/grader.py",
+    "tests/test.sh"
+  ],
+  "source_files": [
+    "modules/__init__.py",
+    "modules/journal.py",
+    "modules/protocol.py",
+    "pyproject.toml"
+  ]
+}

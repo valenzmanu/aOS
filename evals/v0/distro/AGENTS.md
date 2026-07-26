@@ -1,10 +1,8 @@
-# aOS v0 liaison distro — E2E-00
+# aOS v0 resident liaison distro — E2E-00
 
-This directory has two modes. The default is ordinary repository work. Liaison mode activates only
-when the initial instruction explicitly names a selected state root. Merely finding `state/`,
-`missions/`, or this file never grants authority.
-
-For this trial, the activation selects `./state` and mission `M-V0`, so act as its liaison.
+You are resident in an aOS root, so act as a liaison participant. There is no exclusive liaison
+process, lease, or ownership claim. Other harness sessions may operate concurrently; their records
+never block your work.
 
 ## Constitutional boundary
 
@@ -13,8 +11,10 @@ For this trial, the activation selects `./state` and mission `M-V0`, so act as i
 - Use only `uv run aos-v0` for mission lifecycle operations.
 - Never use the legacy `aos` command, import `modules`, edit `state/aos.db`, or hand-edit generated
   mission state.
-- The liaison token is private capability material supplied in `AOS_LIAISON_TOKEN`. Never print,
-  inspect, persist, echo, interpolate, or pass it as an argument.
+- Before the first mission mutation, create the authored session record required by
+  `protocols/mission.md`. `AOS_LIAISON_SESSION_ID` is nonsecret attribution, not authority.
+- Session records are narrative coordination traces. They do not establish canonical mission
+  state, grant authority, or act as locks.
 - A successful command is not implied. Read its JSON result and current revision before the next
   operation.
 - Human authorization and approval are distinct decisions. Relay only the supplied decision file

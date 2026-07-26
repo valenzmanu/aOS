@@ -24,7 +24,6 @@ EXPECTED_TRANSITIONS = (
 )
 EXPECTED_AGENT_ACTIONS = (
     "status",
-    "claim",
     "authorize",
     "dispatch",
     "start",
@@ -36,7 +35,6 @@ EXPECTED_AGENT_ACTIONS = (
 EXPECTED_OPERATIONS = (
     "OP-V0-INIT",
     "OP-V0-SETUP",
-    "OP-V0-CLAIM",
     "OP-V0-AUTHORIZE",
     "OP-V0-DISPATCH",
     "OP-V0-START",
@@ -61,7 +59,7 @@ SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
 LIFECYCLE_COMMAND = re.compile(
     r"(?<![\w-])uv\s+run\s+aos-v0\s+"
-    r"(status|claim|authorize|dispatch|start|finish|verify|decide)\b"
+    r"(status|authorize|dispatch|start|finish|verify|decide)\b"
 )
 LEGACY_COMMAND = re.compile(r"(?<![\w-])(?:uv\s+run\s+)?aos(?!-v0)(?=\s|[\"']|$)")
 FAKE_WORKER_COMMAND = re.compile(
@@ -254,6 +252,19 @@ def _grade_worker_artifacts(
 
 
 def _grade_state_tree(checks: Checks, trial: Path, result_digest: str) -> None:
+    liaison_session = trial / "state" / "liaison" / "sessions" / "LS-V0" / "session.md"
+    expected_session = (
+        b"# Liaison session LS-V0\n\n"
+        b"Harness: Codex\n"
+        b"Focus: M-V0\n"
+    )
+    checks.check(
+        liaison_session.is_file()
+        and not liaison_session.is_symlink()
+        and _read_regular_bytes(liaison_session) == expected_session,
+        "resident harness authored its non-exclusive liaison session record",
+    )
+
     mission_root = trial / "missions" / MISSION_ID
     expected_files = (
         Path("status.json"),
@@ -903,14 +914,16 @@ def _grade_events(
     else:
         envelope = db.execute(
             """
-            SELECT invoker_kind, authority_epoch_id, on_behalf_of, decision_source_hash
+            SELECT invoker_kind, invoker_id, authority_epoch_id,
+                   on_behalf_of, decision_source_hash
             FROM event_envelopes WHERE event_id=?
             """,
             (authorization["id"],),
         ).fetchone()
         checks.check(
             envelope is not None
-            and tuple(envelope) == ("liaison", "AE-V0", "human:v0", AUTHORIZE_HASH),
+            and tuple(envelope)
+            == ("liaison", "LS-V0", None, "human:v0", AUTHORIZE_HASH),
             "authorization transition carries human provenance",
         )
 
@@ -1028,7 +1041,7 @@ def _grade_evidence_and_approval(
     )
     approval_envelope = db.execute(
         """
-        SELECT operation_id, admission_id, invoker_kind, authority_epoch_id,
+        SELECT operation_id, admission_id, invoker_kind, invoker_id, authority_epoch_id,
                on_behalf_of, decision_source_hash
         FROM event_envelopes WHERE event_id=?
         """,
@@ -1054,7 +1067,8 @@ def _grade_evidence_and_approval(
             "OP-V0-DECIDE",
             decide_admission,
             "liaison",
-            "AE-V0",
+            "LS-V0",
+            None,
             "human:v0",
             APPROVE_HASH,
         )

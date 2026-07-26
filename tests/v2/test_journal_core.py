@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ from modules.journal import (
     ExpectedRevision,
     GateRejection,
     InitializationRequest,
+    InvalidOperation,
     Invoker,
     OperationOutcome,
     OperationRequest,
@@ -19,6 +21,7 @@ from modules.journal import (
     append_observation,
     initialize_root,
     read_events,
+    retire_historical_liaison_authority,
 )
 from modules.protocol import RESERVED_EVENT_KINDS
 
@@ -513,3 +516,336 @@ def test_event_envelope_preserves_invoker_human_and_operation_attribution(
             (domain_event_id,),
         ).fetchall()
         assert targets == [("mission", "M-JOURNAL-CORE", "target")]
+
+
+def test_resident_liaison_session_needs_no_authority_epoch(
+    initialized_root: InitializedRoot,
+) -> None:
+    outcome = _run_governed(
+        initialized_root.path,
+        OperationRequest(
+            operation_id="OP-RESIDENT-LIAISON",
+            action="fixture.liaison",
+            invoker=Invoker(kind="liaison", id="LS-CODEX-A8F3"),
+            expected_revisions=(),
+            payload={"focus": "M-JOURNAL-CORE"},
+        ),
+        validator=lambda _context: None,
+        projector=lambda _context: None,
+        clock=lambda: FIXED_TIME,
+    )
+
+    assert outcome.status == "completed"
+    events = read_events(
+        initialized_root.path,
+        after_event_id=initialized_root.initialization_event_id,
+    )
+    assert events[0].kind == "gate.admitted"
+    assert events[0].envelope is not None
+    assert events[0].envelope["invoker_kind"] == "liaison"
+    assert events[0].envelope["invoker_id"] == "LS-CODEX-A8F3"
+    assert events[0].envelope["authority_epoch_id"] is None
+
+
+def test_liaison_session_rejects_authority_epoch(
+    initialized_root: InitializedRoot,
+) -> None:
+    with pytest.raises(InvalidOperation, match="must not carry an authority epoch"):
+        _run_governed(
+            initialized_root.path,
+            OperationRequest(
+                operation_id="OP-LIAISON-WITH-EPOCH",
+                action="fixture.liaison",
+                invoker=Invoker(
+                    kind="liaison",
+                    id="LS-CODEX-A8F3",
+                    authority_epoch_id="AE-OBSOLETE-LIAISON",
+                ),
+                expected_revisions=(),
+                payload={},
+            ),
+            validator=lambda _context: None,
+            projector=lambda _context: None,
+            clock=lambda: FIXED_TIME,
+        )
+
+
+def test_liaison_invoker_requires_session_shaped_identifier(
+    initialized_root: InitializedRoot,
+) -> None:
+    with pytest.raises(InvalidOperation, match="liaison invoker id"):
+        _run_governed(
+            initialized_root.path,
+            OperationRequest(
+                operation_id="OP-LIAISON-WITHOUT-SESSION",
+                action="fixture.liaison",
+                invoker=Invoker(kind="liaison", id="liaison:codex"),
+                expected_revisions=(),
+                payload={},
+            ),
+            validator=lambda _context: None,
+            projector=lambda _context: None,
+            clock=lambda: FIXED_TIME,
+        )
+
+
+def test_worker_still_requires_delegated_authority_epoch(
+    initialized_root: InitializedRoot,
+) -> None:
+    outcome = _run_governed(
+        initialized_root.path,
+        OperationRequest(
+            operation_id="OP-WORKER-WITHOUT-EPOCH",
+            action="fixture.worker",
+            invoker=Invoker(kind="worker", id="worker:one"),
+            expected_revisions=(),
+            payload={},
+        ),
+        validator=lambda _context: None,
+        projector=lambda _context: None,
+        clock=lambda: FIXED_TIME,
+    )
+
+    assert outcome.status == "rejected"
+    assert outcome.reason == "authority_missing"
+
+
+def test_stale_session_record_never_blocks_another_resident_session(
+    initialized_root: InitializedRoot,
+) -> None:
+    stale = (
+        initialized_root.path
+        / "liaison"
+        / "sessions"
+        / "LS-ORPHANED"
+        / "session.md"
+    )
+    stale.parent.mkdir(parents=True)
+    stale.write_text("# Liaison session LS-ORPHANED\n\nStatus: active\n")
+
+    outcome = _run_governed(
+        initialized_root.path,
+        OperationRequest(
+            operation_id="OP-AFTER-ORPHANED-SESSION",
+            action="fixture.liaison",
+            invoker=Invoker(kind="liaison", id="LS-CURSOR-NEW"),
+            expected_revisions=(),
+            payload={},
+        ),
+        validator=lambda _context: None,
+        projector=lambda _context: None,
+        clock=lambda: FIXED_TIME,
+    )
+
+    assert outcome.status == "completed"
+
+
+def test_historical_active_liaison_epoch_is_inert_after_cutover(
+    initialized_root: InitializedRoot,
+) -> None:
+    with sqlite3.connect(initialized_root.path / "aos.db") as db:
+        db.execute(
+            """
+            INSERT INTO aggregate_revisions(
+                aggregate_type, aggregate_id, revision,
+                genesis_event_id, source_event_id
+            ) VALUES ('authority_epoch', 'AE-HISTORICAL-LIAISON', 1, ?, ?)
+            """,
+            (
+                initialized_root.initialization_event_id,
+                initialized_root.initialization_event_id,
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO authority_epochs(
+                epoch_id, kind, subject_id, scope, token_hash,
+                issued_at, expires_at, status, issued_event_id
+            ) VALUES (
+                'AE-HISTORICAL-LIAISON', 'liaison', 'liaison:old',
+                'liaison:root', ?, ?, ?, 'active', ?
+            )
+            """,
+            (
+                "a" * 64,
+                "2026-07-23T15:00:00.000+00:00",
+                "2099-07-23T15:00:00.000+00:00",
+                initialized_root.initialization_event_id,
+            ),
+        )
+
+    outcome = _run_governed(
+        initialized_root.path,
+        OperationRequest(
+            operation_id="OP-AFTER-HISTORICAL-LIAISON",
+            action="fixture.liaison",
+            invoker=Invoker(kind="liaison", id="LS-CODEX-CUTOVER"),
+            expected_revisions=(),
+            payload={},
+        ),
+        validator=lambda _context: None,
+        projector=lambda _context: None,
+        clock=lambda: FIXED_TIME,
+    )
+
+    assert outcome.status == "completed"
+
+    cutover_request = OperationRequest(
+        operation_id="OP-RETIRE-HISTORICAL-LIAISON",
+        action="journal.retire_liaison_authority",
+        invoker=Invoker(
+            kind="maintenance_operator",
+            id="maintenance:resident-liaison-cutover",
+        ),
+        expected_revisions=(
+            ExpectedRevision("authority_epoch", "AE-HISTORICAL-LIAISON", 1),
+        ),
+        payload={"epoch_ids": ["AE-HISTORICAL-LIAISON"]},
+    )
+    cutover = retire_historical_liaison_authority(
+        initialized_root.path,
+        cutover_request,
+        clock=lambda: FIXED_TIME,
+    )
+    replay = retire_historical_liaison_authority(
+        initialized_root.path,
+        cutover_request,
+        clock=lambda: FIXED_TIME,
+    )
+
+    assert cutover.status == "completed"
+    assert replay.status == "replayed"
+    with sqlite3.connect(initialized_root.path / "aos.db") as db:
+        assert db.execute(
+            """
+            SELECT status, close_reason
+            FROM authority_epochs
+            WHERE epoch_id='AE-HISTORICAL-LIAISON'
+            """
+        ).fetchone() == ("closed", "resident_liaison_cutover")
+
+
+def test_resident_sessions_advance_unrelated_aggregates_concurrently(
+    initialized_root: InitializedRoot,
+) -> None:
+    def request(operation_id: str, session_id: str, mission_id: str) -> OperationRequest:
+        return OperationRequest(
+            operation_id=operation_id,
+            action="mission.create",
+            invoker=Invoker(kind="liaison", id=session_id),
+            expected_revisions=(ExpectedRevision("mission", mission_id, 0),),
+            payload={"mission_id": mission_id},
+        )
+
+    def projector(mission_id: str) -> Callable[[object], None]:
+        def project(context: object) -> None:
+            context.append_event(  # type: ignore[attr-defined]
+                "mission.created",
+                "mission",
+                mission_id,
+                {"state": "draft"},
+            )
+
+        return project
+
+    first = _run_governed(
+        initialized_root.path,
+        request("OP-SESSION-A-MISSION", "LS-CODEX-A", "M-SESSION-A"),
+        validator=lambda _context: None,
+        projector=projector("M-SESSION-A"),
+        clock=lambda: FIXED_TIME,
+    )
+    second = _run_governed(
+        initialized_root.path,
+        request("OP-SESSION-B-MISSION", "LS-CURSOR-B", "M-SESSION-B"),
+        validator=lambda _context: None,
+        projector=projector("M-SESSION-B"),
+        clock=lambda: FIXED_TIME,
+    )
+
+    assert first.status == second.status == "completed"
+    assert first.revisions[0].revision == second.revisions[0].revision == 1
+
+
+def test_resident_sessions_resolve_same_revision_conflict_at_the_aggregate(
+    initialized_root: InitializedRoot,
+) -> None:
+    mission_id = "M-SESSION-RACE"
+
+    def request(operation_id: str, session_id: str) -> OperationRequest:
+        return OperationRequest(
+            operation_id=operation_id,
+            action="mission.create",
+            invoker=Invoker(kind="liaison", id=session_id),
+            expected_revisions=(ExpectedRevision("mission", mission_id, 0),),
+            payload={"mission_id": mission_id},
+        )
+
+    def create(context: object) -> None:
+        context.append_event(  # type: ignore[attr-defined]
+            "mission.created",
+            "mission",
+            mission_id,
+            {"state": "draft"},
+        )
+
+    first = _run_governed(
+        initialized_root.path,
+        request("OP-SESSION-RACE-A", "LS-CODEX-RACE"),
+        validator=lambda _context: None,
+        projector=create,
+        clock=lambda: FIXED_TIME,
+    )
+    second = _run_governed(
+        initialized_root.path,
+        request("OP-SESSION-RACE-B", "LS-CURSOR-RACE"),
+        validator=lambda _context: None,
+        projector=create,
+        clock=lambda: FIXED_TIME,
+    )
+
+    assert first.status == "completed"
+    assert second.status == "rejected"
+    assert second.reason == "revision_mismatch"
+    assert second.revisions[0].revision == 1
+
+
+def test_identical_liaison_operation_replays_across_harness_sessions(
+    initialized_root: InitializedRoot,
+) -> None:
+    def request(session_id: str) -> OperationRequest:
+        return OperationRequest(
+            operation_id="OP-CROSS-SESSION-REPLAY",
+            action="fixture.liaison",
+            invoker=Invoker(kind="liaison", id=session_id),
+            expected_revisions=(),
+            payload={"effect": "dispatch-once"},
+        )
+
+    first = _run_governed(
+        initialized_root.path,
+        request("LS-CODEX-ORIGINAL"),
+        validator=lambda _context: None,
+        projector=lambda _context: None,
+        clock=lambda: FIXED_TIME,
+    )
+    replay = _run_governed(
+        initialized_root.path,
+        request("LS-CURSOR-RECOVERY"),
+        validator=lambda _context: None,
+        projector=lambda _context: pytest.fail("replay must not project a second effect"),
+        clock=lambda: FIXED_TIME,
+    )
+
+    assert first.status == "completed"
+    assert replay.status == "replayed"
+    assert replay.original_status == "completed"
+    assert replay.admission_event_id == first.admission_event_id
+    with sqlite3.connect(initialized_root.path / "aos.db") as db:
+        assert db.execute(
+            """
+            SELECT invoker_id
+            FROM operations
+            WHERE operation_id='OP-CROSS-SESSION-REPLAY'
+            """
+        ).fetchone() == ("LS-CODEX-ORIGINAL",)

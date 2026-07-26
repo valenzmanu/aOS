@@ -1,6 +1,6 @@
 ---
 title: aOS 2.0 implementation plan — SCAOS substrate
-status: v0 foundation established; legacy source cut over; remaining milestones active
+status: v0 foundation established; next focus mission controls → readable project state → new-agent continuation
 decision: docs/adr/0002-sparse-constitutional-agent-os.md
 predecessor: historical 0.1 plan at e920ff2:docs/aos-poc-plan.md
 harbor_baseline: 0.20.0; task schema 1.3
@@ -17,6 +17,51 @@ harbor_baseline: 0.20.0; task schema 1.3
 Read ADR 0002 first. It contains the architectural decision; this file fixes the implementation
 contracts, build order, and evidence required to claim each milestone. The measurement layer is
 built before the intent layer because prose has no compiler.
+
+## What aOS preserves
+
+aOS is not a replacement for harness memory. Harnesses may keep their own context windows. aOS
+preserves the durable work a new human or liaison must recover after a closed chat, harness switch,
+or new machine:
+
+| aOS concept | What it is | Why it exists |
+| --- | --- | --- |
+| Distro (`AGENTS.md`, protocols, skills) | Portable instructions for resident agents | Turns a general harness into an aOS participant |
+| State Tree (`missions/`, sessions, evidence files) | Navigable project interface | A new agent can open files and see what is going on |
+| Journal | Canonical event history | Contested truth survives outside any conversation |
+| Human decisions | Explicit authorize / approve provenance | Authority is placed, not assumed |
+| Liaison session (`LS-*`) | Attribution for a resident harness | Coordination only; never exclusive ownership |
+| Worker / process capability | Scoped delegated authority | Execution stays inside a work-order membrane |
+
+The honest test: delete every agent session, give a clean checkout plus a portable export to a
+fresh harness, and require that it can answer *running / blocked / decided-why / verified /
+approvable* from journal + State Tree alone, author its own liaison session, and admit a follow-up
+transition without inheriting prior liaison ownership.
+
+### Build priority (plain names first)
+
+Stable milestone IDs remain in parentheses for tests and historical cross-references. Prefer the
+plain names in discussion and docs:
+
+```text
+Durable foundation (M1) — partially landed
+  → Mission controls (M2)
+  → Readable project state (M3)
+  → New-agent continuation test (H-01; may land before full M5 packaging)
+  → Real workers (M4)
+  → Continue on a new machine / publish closure (M5)
+```
+
+The **first end-to-end trial** (`E2E-00`) remains the permanent thin tracer for one resident
+mission. It does not satisfy continuation until a fresh liaison can reconstruct from journal +
+State Tree without the original harness conversation.
+
+Current foundation:
+
+- **Landed:** schema-4 journal/protocol joints, resident non-exclusive liaison sessions, first
+  end-to-end trial (`E2E-00`), legacy Python control-plane removal.
+- **Next:** mission controls (M2), then readable project state (M3), then a new-agent continuation
+  path reusable by `H-01`.
 
 ## Ground rules for the implementor
 
@@ -111,15 +156,18 @@ Every v2 event has a versioned envelope containing:
 - event ID and time;
 - kind and payload schema version;
 - event aggregate type and ID, plus any target-domain aggregate IDs;
-- invoker kind and ID, with authority/lease epoch ID and evaluated expiry when authority-bearing;
+- invoker kind and ID, with a liaison session ID for resident liaison operations or an
+  authority/lease epoch ID and evaluated expiry when authority-bearing;
 - optional `on_behalf_of` principal attribution and decision-source hash for relayed human actions;
 - request/idempotency key;
 - causation ID and admission ID, when applicable;
 - canonical JSON payload with no secret-shaped data at any nesting depth.
 
-Legitimate invokers include liaison, liaison candidate, worker, maintenance operator, module/system,
-migration, reconciler, and eval fixture. Only authority-bearing invokers require an epoch. A system
-reconciliation event and the journaled rejection of an expired mutation remain valid events.
+Legitimate invokers include resident liaison sessions, workers, maintenance operators,
+module/system, migration, reconciler, and eval fixtures. Liaison sessions provide attribution and
+never carry an authority epoch. Only delegated authority-bearing invokers such as workers require
+an epoch. A system reconciliation event and the journaled rejection of an expired worker mutation
+remain valid events.
 
 Revision rules are exact:
 
@@ -130,12 +178,15 @@ Revision rules are exact:
   admission, approval, transition, and effect events;
 - an operation declares expected revisions for every existing contested aggregate it reads or
   writes; a new aggregate uses `absent`/revision 0;
-- operation IDs are repository-wide unique and bound to canonical request hash plus invoker;
-  reuse with different input or invoker is rejected.
+- operation IDs are repository-wide unique and bound to a canonical request hash. Delegated
+  authority invoker identity remains part of that hash. Resident liaison session ID is attribution,
+  not semantic identity: an identical request may replay across liaison sessions, while different
+  input or human-decision provenance is rejected.
 
 For a database-only governed operation, one `BEGIN IMMEDIATE` transaction:
 
-1. authenticates the capability and records its authority epoch;
+1. validates the resident liaison session attribution or authenticates a delegated capability and
+   records its authority epoch;
 2. checks every validator applicable at that milestone: expected revision, authorization policy,
    FSM edge, preconditions, and (after M3 integration) the pinned distro;
 3. appends `gate.admitted` or `gate.rejected`;
@@ -174,39 +225,48 @@ caller's expected revision before admission.
 
 | Actor | May do | Must not do |
 | --- | --- | --- |
-| Human decision, relayed by active liaison | authorize a contract revision; approve or reject delivery; widen authority or retry ceiling; order cancellation | masquerade as a worker or omit decision provenance |
-| Active liaison lease | create drafts; route and dispatch authorized work; choose retry level; signal processes; invoke verification; propose transitions | authorize its own contract; approve its own delivery |
-| Liaison candidate, locally attributed but not authority-bearing | claim a liaison slot only when no unexpired epoch remains, or complete an explicitly authorized transfer | mutate mission state, migrate data, or bypass an unexpired liaison |
+| Human decision, relayed by a resident liaison session | authorize a contract revision; approve or reject delivery; widen authority or retry ceiling; order cancellation | masquerade as a worker or omit decision provenance |
+| Resident liaison session, locally attributed and non-exclusive | create authored session records and drafts; route and dispatch authorized work; choose retry level; signal processes; invoke verification; propose transitions | authorize its own contract; approve its own delivery; treat another session record as ownership or a lock |
 | Scoped worker capability | start/update its own process/session; append checkpoints; publish candidate artifacts | mutate mission state; widen scope; verify, approve, deliver, spawn, or delegate |
 | Maintenance operator, locally attributed but not mission-authority-bearing | initialize an empty root; explicitly migrate a process-quiesced root with no live v2 authority epoch | perform mission work, approve delivery, or bypass a live writer/v2 epoch |
 | Module/system, migration, or reconciler | append narrowly typed mechanical/recovery facts under a causative operation | claim human judgment or widen mission authority |
 | Eval verifier | read exported state and trajectories; write verifier-only grades | mutate runtime journal or State Tree |
 
-At level 1, a human principal is explicit **attribution**, relayed by the active liaison, not
+At level 1, a human principal is explicit **attribution**, relayed by a resident liaison session, not
 cryptographically authenticated identity. The gate proves that a worker capability cannot approve
-and records both the invoking liaison/epoch and who the liaison says made the decision. Strong
+and records both the invoking liaison session and who the liaison says made the decision. Strong
 principal authentication is level-2 work.
 
 Bootstrap is only the empty-root initialization case of maintenance. Initialization and every
 later explicit schema migration require an operation ID, request hash, expected schema/root state,
 and journaled maintenance/migration facts. They are admitted only on a quiesced root with no live
-v2 authority epoch or v2 external-effect intent. A migration may import still-unexpired legacy
-epoch rows only after OS/process checks prove all 0.1 writers are stopped; its final transaction
-closes those imported epochs as part of cutover. Initializing a nonempty root is permanently
-forbidden; later maintenance never acquires mission authority.
+delegated authority epoch or v2 external-effect intent. A migration may import still-unexpired
+legacy epoch rows only after OS/process checks prove all 0.1 writers are stopped; its final
+transaction closes imported liaison epochs as historical cutover facts and reconciles delegated
+epochs as required. Initializing a nonempty root is permanently forbidden; later maintenance never
+acquires mission authority.
 
-Every lease claim, including the first, uses the non-authority-bearing liaison-candidate role. Its
-gate may only reconcile an expired epoch (or consume an explicit transfer authorization) and
-atomically create the next liaison epoch when no unexpired epoch remains. Admission grants the new
-liaison capability but never grants initialization, migration, or any pre-claim mission power.
+The root's `AGENTS.md` establishes liaison behavior for every resident harness. Before its first
+governed mission mutation, a harness authors a unique record under
+`state/liaison/sessions/<session-id>/`. Session status and timestamps are coordination hints only:
+they grant no authority, block nothing, and require no close, expiry, transfer, or takeover. The
+journal attributes liaison operations to the session ID and gates conflicting work through
+expected aggregate revisions, operation IDs, and canonical request hashes.
 
-V2 preserves rolling TTL behavior but makes it observable. Claim or rotation creates an authority
-epoch with an absolute expiry. An authority-bearing mutation may explicitly request renewal; the
-gate evaluates time through an injectable clock and appends `authority.renewed` in the same
-transaction. Reads and unrelated commands never renew silently. Release, rotation, expiry
-reconciliation, and cancellation append revocation/closure facts. No canonical mutation is
-accepted under an expired epoch, although its rejection and subsequent system reconciliation are
-journaled.
+Schema 4 already permits epoch-free invokers, so the resident-session cutover does not require a
+schema-number change or history rewrite. Any pre-cutover active liaison epoch is immediately inert:
+resident liaison admission never queries it. The explicit replay-safe
+`journal.retire_liaison_authority` maintenance operation may close those historical rows with
+`authority.legacy_closed` events and no replacement epoch. This cleanup improves historical
+legibility but is never a prerequisite for resident sessions to proceed.
+
+V2 preserves rolling TTL behavior for delegated worker/process authority. Creation or rotation
+creates an authority epoch with an absolute expiry. An authority-bearing worker mutation may
+explicitly request renewal; the gate evaluates time through an injectable clock and appends
+`authority.renewed` in the same transaction. Reads and unrelated commands never renew silently.
+Release, rotation, expiry reconciliation, and cancellation append revocation/closure facts. No
+canonical worker mutation is accepted under an expired epoch, although its rejection and
+subsequent system reconciliation are journaled.
 
 The protocol module owns a closed graph; callers never supply `allowed_from` sets.
 
@@ -337,28 +397,20 @@ validators, but every contested database mutation commits through one journal tr
 remain importable by tests and internal composition; no agent-facing workflow depends on direct
 Python imports or `aos/cli.py`.
 
-Except for shell activation, stdout is one stable JSON object containing `status`, `operation_id`,
-relevant event/entity/revision fields, and `help[]`. Diagnostics go to stderr.
+Stdout is one stable JSON object containing `status`, `operation_id`, relevant
+event/entity/revision fields, and `help[]`. Diagnostics go to stderr.
 
 - exit 0: admitted and completed, or an idempotent replay of that result;
 - exit 1: constitutional rejection, including its committed rejection event ID;
 - exit 2: invalid invocation, unsupported schema, or operational/infrastructure failure.
 
-Liaison claim is a source-only shell activation command used in a dedicated persistent shell. It
-generates the raw token before admission, captures it through an anonymous non-rendered pipe into
-`AOS_LIAISON_TOKEN`, and supplies it to the claim module through inherited environment; execution
-instead of sourcing is refused and shell tracing is disabled. The module persists only the hash,
-and the request fingerprint includes that hash. Other commands read the token only from the
-environment.
-
-Secret-bearing creation is the one replay exception: an uncertain claim/dispatch retry succeeds
-only while the trusted wrapper still holds the same raw token and operation ID. A lost secret is
-never reconstructed or returned from the journal; its epoch must expire or be explicitly
-revoked/rotated. The trusted dispatch wrapper generates a worker token before admission, passes its
-hash to the module, and injects the raw value directly into the adapter child environment. If the
-wrapper crashes before handoff is confirmed, reconciliation closes that epoch and creates a new
-one rather than recovering the secret. Tokens never pass through JSON or files. Tests scan the
-database, terminal output, State Tree, artifacts, and Harbor results for leakage.
+Liaison commands accept a nonsecret session ID whose authored record lives under
+`state/liaison/sessions/`; they never accept or reconstruct a root-wide liaison token. The trusted
+dispatch wrapper generates a worker token before admission, passes its hash to the module, and
+injects the raw value directly into the adapter child environment. If the wrapper crashes before
+handoff is confirmed, reconciliation closes that worker epoch and creates a new one rather than
+recovering the secret. Tokens never pass through JSON or files. Tests scan the database, terminal
+output, State Tree, artifacts, and Harbor results for leakage.
 
 Mutation commands require a caller-supplied nonsecret operation ID and expected revision; omission
 is exit 2. The distro teaches agents to persist the operation ID and reuse it after an uncertain
@@ -474,6 +526,7 @@ aOS/
 │   ├── checks/
 │   └── rubrics/
 ├── state/                            # selected canonical journal root; gitignored
+│   ├── liaison/sessions/             # authored, non-exclusive harness attribution
 │   ├── aos.db
 │   └── blobs/sha256/                 # immutable content-addressed snapshots/evidence
 └── aos/                              # feature-frozen 0.1; isolated until M5 cutover
@@ -495,7 +548,10 @@ commands from outside the checkout and confirms that the clone's protocols and s
 
 ## Milestones
 
-### M0 — Decision artifacts and implementation-mode guardrails
+Use the plain title in discussion. The legacy `M#` / scenario IDs stay in parentheses so existing
+evidence names remain stable.
+
+### Decision artifacts and guardrails (M0)
 
 Completed in commit `eb9c6a4`: the design and disarmament changes were committed together after
 the legacy watcher was stopped and the repository-development instructions were verified.
@@ -510,9 +566,10 @@ the legacy watcher was stopped and the repository-development instructions were 
 **Exit evidence:** a clean commit containing only decision/guardrail files; `uv run pytest`,
 `uv run ruff check .`, and `uv run python scripts/check_public_tree.py` green.
 
-### M1 — Journal contract, compatibility, and Harbor spike
+### Durable foundation (M1)
 
-M1 is delivered as four independently green slices.
+Contested truth must already survive outside any harness chat. Delivered as four independently
+green slices.
 
 #### M1a — Characterization and migration
 
@@ -556,9 +613,10 @@ Every check has a known-good fixture and a minimally corrupted fixture proving i
   `solution/solve.sh`, separate-verifier artifact transfer, multi-metric `reward.json`, retained
   verifier details, result parsing, and wrapper failure behavior in `HBR-01`.
 - Only after `HBR-01` passes, package the ported acceptance scenarios as Harbor tasks:
-  - `G-01`: narrow empty-root maintenance, candidate first claim, singleton denial, explicit
-    renewal/release, and vacant/expired takeover;
-  - `G-02`: missing, wrong, cross-process, expired, and revoked authority with historical epochs;
+  - `G-01`: narrow empty-root maintenance, concurrent resident liaison sessions, stale-session
+    tolerance, different-mission concurrency, and same-revision conflict rejection;
+  - `G-02`: missing, wrong, cross-process, expired, and revoked delegated worker authority with
+    historical epochs;
   - `G-03`: legal/illegal FSM cross-product, including new v2 cancel/reject/amend edges, with
     persisted rejection;
   - `G-04`: expired-worker reconciliation to orphaned/failed, without automatic rerouting;
@@ -573,7 +631,17 @@ Every check has a known-good fixture and a minimally corrupted fixture proving i
 the other; the pinned Harbor Oracle suite runs only against disposable state; `evals/run.py`
 produces valid two-grade reports and fails closed on every corrupted fixture.
 
-### M2 — Constitutional mechanics, evidence, and toolbelt
+### Mission controls (M2)
+
+Humans authorize and approve; resident liaisons propose gated transitions; workers receive only
+scoped membranes. Without mission controls, durable foundation exists but agents cannot operate
+real missions through trusted commands.
+
+**Learning mission:** [`evals/learning/aos-landing/`](../evals/learning/aos-landing/) starts from a
+vague human request (“create a landing page…”) and forces aOS to learn intake, interview, and
+evaluable-contract gates before dispatch/verify. Prefer discovering missing controls from that
+loop (append to `LEARNINGS.md`) over speculative module growth. Thin slice already in tree:
+`aos-mission` intake → propose-contract → authorize (`modules/mission_controls.py`).
 
 - Implement `authz.py`, `worktree.py`, `verify.py`, `approve.py`, and the reusable manifest logic
   in `pin.py`.
@@ -581,9 +649,11 @@ produces valid two-grade reports and fails closed on every corrupted fixture.
   Reconciliation handles a branch, directory, process, blob, or evidence intent left incomplete at
   any injected crash point.
 - Make verification evidence immutable and bind approval exactly as specified above.
-- Build `bin/` operations for initialization/migration, shell lease activation, draft creation,
-  authorization relay, transition proposal, worktree creation, checkpoint append, verification,
-  approval relay, retry, cancellation, reconciliation, projection, and divergence checking.
+- Build `bin/` operations for initialization/migration, draft creation, authorization relay,
+  transition proposal, worktree creation, checkpoint append, verification, approval relay, retry,
+  cancellation, reconciliation, projection, and divergence checking. Resident-session records are
+  authored through normal file tools under distro instruction; they are not a constitutional
+  command or gate.
 - Implement recursive secret rejection across event payloads, session metadata, evidence metadata,
   terminal output, and exported eval artifacts.
 - Implement the tree/journal divergence checker against fixture projections. It records one
@@ -609,25 +679,32 @@ Scenarios:
 module imports remain available to tests/internal composition; no old CLI is in v2 scenario paths;
 rejection, crash, replay, stale revision, evidence binding, and secret scans all pass.
 
-### M3 — State Tree, pinned distro, and intent evaluation
+### Readable project state (M3)
+
+A new liaison must be able to open the State Tree, render `watch`, follow distro skills for
+reconstruction, and continue without the previous harness's memory. This is the operator-visible
+aOS interface: files + instructions + journal-backed projections.
 
 - Implement the mission/process/session State Tree above and deterministic byte-for-byte
   regeneration of its **generated projections** from journal + blobs while preserving authored
   files.
-- Rewrite root `AGENTS.md` as a dual-mode portable distro entry. Repository-development requests
-  remain implementor mode and never claim a lease. Liaison mode requires explicit user/runtime
-  activation naming a selected state root; discovering state files alone never activates it.
-  Write `protocols/constitution.md`, `protocols/mission.md`, and `protocols/work-order.md`.
-- Write liaison/worker skills for claiming, drafting, routing, dispatching, supervising, retrying,
-  verifying, approval relay, reconstruction, and watch.
-- Pin a sorted constitutional manifest of `AGENTS.md` + `protocols/` at lease claim; record a
+- Rewrite root `AGENTS.md` as the portable distro entry. Every harness resident in the aOS root
+  follows liaison behavior and authors a unique non-exclusive session record before its first
+  governed mission mutation. Other session records never act as locks. Write
+  `protocols/constitution.md`, `protocols/mission.md`, and `protocols/work-order.md`.
+- Write liaison/worker skills for session recording, drafting, routing, dispatching, supervising,
+  retrying, verifying, approval relay, reconstruction, and watch. The reconstruction skill must
+  teach the five continuation questions (*running / blocked / decided-why / verified /
+  approvable*) from journal + State Tree only — never from harness chat history.
+- Pin a sorted constitutional manifest of `AGENTS.md` + `protocols/` at root initialization and
+  record its observed digest in liaison session provenance; record a
   separate informational distro version including `skills/`. Every gated operation validates the
   constitutional pin. Add/remove/rename/edit drift there quarantines privileged transitions and
   journals one deduplicated violation. Skills drift is recorded in run/session provenance and
   triggers distro evals, but does not become a new constitutional gate without a ratchet scenario.
   Re-pinning the constitution requires an explicit human-authorized distro upgrade naming the
   expected old and new manifests. During quarantine, fail-safe operations remain allowed:
-  read/watch/check/export, lease release, authority revocation, cancellation, safe reconciliation,
+  read/watch/check/export, authority revocation, cancellation, safe reconciliation,
   and authorized re-pin. Authority-expanding or progress-making operations are rejected.
 - Implement `bin/watch` as a read-only renderer of journal + State Tree. It never consumes
   deliveries or writes canonical state. Reconciliation and violation recording remain explicit
@@ -637,7 +714,7 @@ rejection, crash, replay, stale revision, evidence binding, and secret scans all
   `gpt-5.6-sol` through the env-auth eval adapter. Changing either is a reviewed plan/config
   change, never an implicit `latest` upgrade.
 - Add the pinned headless reference-agent scenario, given only the distro entry and a mission
-  objective, with explicit liaison-mode activation, a selected disposable state root, a fake
+  objective inside a selected disposable aOS root, with a fake
   worker backend, and distinct scripted human-decision fixtures. The agent must navigate:
   `draft -> authorize -> dispatch -> implement -> verify -> awaiting approval -> decision ->
   deliver` without importing modules directly or invoking 0.1 control flow.
@@ -650,13 +727,18 @@ headless end-to-end mission from distro files; `D-03` proves retry judgment is i
 not Python orchestration; `D-04` proves constitutional-pin drift quarantine, authorized re-pin, and
 non-gating skills-drift provenance.
 
-### M4 — Real-harness dogfood and judge calibration
+### Real workers (M4)
+
+Prove the liaison supervises and does not do the work alone. Do not expand multi-harness worker
+claims until readable project state (M3) exists and a new-agent continuation path (`H-01`-shaped)
+is available. Judge rubrics must score briefing fidelity to journal/State Tree, not to
+harness-private memory.
 
 Separate native UI evidence from Harbor-supported agents:
 
-- **Native dogfood:** explicitly activate the distro's liaison mode for a selected state root in
-  Cursor's Agents Window, then dispatch one Cursor worker and one Codex worker through
-  harness-specific skills. Record journal/export evidence.
+- **Native hands-on trial:** become resident in a selected aOS root from Cursor's Agents Window
+  (root `AGENTS.md` is sufficient; no exclusive activation or lease), then dispatch one Cursor
+  worker and one Codex worker through harness-specific skills. Record journal/export evidence.
 - **Harbor comparison:** run the same checked-in tasks as separate trials using Harbor's
   `cursor-cli` adapter and the env-auth Codex adapter. Do not describe this as an Agents Window
   test. Pin the Codex CLI binary version; record the detected Cursor CLI version without supplying
@@ -683,14 +765,19 @@ CI lanes:
   tasks, projection, privacy, and packaging; blocking on every change.
 - **Model/distro:** pinned headless-agent and judge calibration tasks; required after
   behavior-changing `AGENTS.md`, `protocols/`, or `skills/` edits and before release.
-- **Native dogfood:** Cursor Agents Window plus real Cursor/Codex workers; recorded release
+- **Native hands-on trial:** Cursor Agents Window plus real Cursor/Codex workers; recorded release
   evidence, not misrepresented as deterministic CI.
 
-**Exit evidence:** real dogfood and both Harbor agent adapters produce valid two-grade reports; all
-governance passes; judge calibration agrees with the labeled set within its declared tolerance; the
-predeclared degraded distro is caught at the declared threshold.
+**Exit evidence:** the hands-on trial and both Harbor agent adapters produce valid two-grade
+reports; all governance passes; judge calibration agrees with the labeled set within its declared
+tolerance; the predeclared degraded distro is caught at the declared threshold.
 
-### M5 — Reconstruction, writer cutover, and 0.1 removal
+### Continue on a new machine (M5)
+
+Package a portable aOS root so a fresh harness on another machine can continue. Prefer landing the
+**new-agent continuation test** (`H-01`) as soon as readable project state (M3) exists; remaining
+cutover and publish-gate work may complete afterward. Conversation state, harness memory, and
+operational worktrees are excluded from the export — they are not durable aOS state.
 
 #### Pre-cutover gate
 
@@ -711,15 +798,14 @@ predeclared degraded distro is caught at the declared threshold.
 - Run the honest reconstruction task locally and on a clean Linux CI runner. The runner receives
   only a clean checkout at the pinned distro revision plus the export bundle; no previous process,
   harness session, or hidden state exists.
-- `H-01` is a Harbor task using the checked-in pinned M3 Codex reference configuration, explicit
-  liaison-mode activation, and a selected reconstructed state root. It verifies the bundle
+- `H-01` is a Harbor task using the checked-in pinned M3 Codex reference configuration while
+  resident in a selected reconstructed aOS root. It verifies the bundle
   manifest before reading state. Oracle or another scripted agent may test fixtures but cannot
   satisfy the honest reconstruction claim.
-- The fresh liaison must answer *running / blocked / decided-why / verified / approvable* against
-  verifier truth. It first reconstructs read-only while the exported prior liaison lease remains
-  active and proves a second claim is rejected. After expiry through an injected clock or an
-  explicit authorized transfer, it claims a new epoch and only then performs a proposed transition
-  through a journaled admit.
+- The fresh liaison session must answer *running / blocked / decided-why / verified / approvable*
+  against verifier truth, author its own session record, and then perform a proposed transition
+  through a journaled admit. Historical or apparently active session records must not delay or
+  block reconstruction.
 - Run all M1-M4 suites against a disposable migrated copy while 0.1 remains frozen and available
   for rollback.
 - Rerun the unchanged 0.1 acceptance suite on a legacy root and build a pinned rollback artifact
@@ -732,7 +818,8 @@ predeclared degraded distro is caught at the declared threshold.
 
 - Back up and integrity-check the selected live 0.1 state root; stop all 0.1 writers; perform the
   one-way v2 migration; close/reconcile legacy authority and active runtime state as specified;
-  verify the migration manifest; then require a fresh v2 liaison claim before any mission work.
+  verify the migration manifest; then require a fresh resident liaison session record before any
+  mission work.
 - Delete superseded 0.1 orchestration entrypoints and compatibility paths (`aos/cli.py` flow,
   `aos/control.py` orchestration, `aos/daemon.py`, old console scripts, auto-run editor tasks, and
   obsolete docs/rules). Keep only code genuinely absorbed by `modules/`.
@@ -749,10 +836,10 @@ uv run python evals/run.py --all
 
 `--all` runs every automatable offline, reference-agent, harness-comparison, and judge/calibration
 lane and fails early when required provider/judge credentials are unavailable. Native Cursor
-Agents Window dogfood is deliberately outside automatable CI; its checked release-evidence manifest
-is a separate M5 prerequisite.
+Agents Window hands-on trials are deliberately outside automatable CI; their checked
+release-evidence manifest is a separate M5 prerequisite.
 
-Before the first v2 liaison claim or post-migration contested domain write, rollback may restore the
+Before the first post-migration contested domain write, rollback may restore the
 pre-migration backup and pinned 0.1 source/environment artifact. That is the point of no return.
 After any v2 operational write is admitted, rollback to 0.1 is forbidden because it would discard
 canonical history; recovery is forward-only unless a separately tested reverse migration is added.
@@ -767,9 +854,10 @@ publish gate is green against the migrated state format.
 | Invariant | Owner | Required evidence |
 | --- | --- | --- |
 | Lossless, one-way v1/v2 migration | `journal` | `G-07`, row/hash/safe-artifact comparison, quarantine manifest, deterministic baseline revisions, repeat/fault/future-schema results, integrity reports |
-| Maintenance and lease candidacy cannot become mission authority | `journal` + `lease` | empty-root/migration/first-and-later-claim cases in `G-01`/`G-07`, denied privilege-crossing attempts |
+| Maintenance cannot become mission authority | `journal` | empty-root/migration cases in `G-01`/`G-07`, denied privilege-crossing attempts |
 | Every canonical transition is admitted or rejected durably | `journal` + `protocol` | `G-03`, `G-08`, admission/rejection IDs in `grades.json` |
-| Authority is scoped, explicitly renewed, expiring, and historically auditable | `lease` + `authz` | `G-01`, `G-02`, `G-05`, invoker/epoch/renewal/expiry query output |
+| Delegated worker authority is scoped, explicitly renewed, expiring, and historically auditable | `lease` + `authz` | `G-02`, `G-05`, invoker/epoch/renewal/expiry query output |
+| Resident liaison sessions are attributable, concurrent, and never exclusive | distro + `journal` | `G-01`, session records, stale-session tolerance, same-revision conflict |
 | Retry identity and ceiling are enforced without retry orchestration in code | `protocol` + distro | `G-06`, `D-03`, journal and agent trajectory |
 | External effects and blob publication are admit-first and idempotent | `worktree` + operation protocol | `G-09`, failure-point/replay/CAS manifests, no dangling database references |
 | Delivery names current immutable passing evidence and attributed human decision | `verify` + `approve` | `G-10`, canonical worktree/evidence digests, invoker + `on_behalf_of`, stale/tamper failures |
@@ -777,8 +865,10 @@ publish gate is green against the migrated state format.
 | Constitution drift quarantines transitions; skills drift stays observable | `pin` + distro | `D-04`, manifests, deduplicated violation, and skills provenance |
 | Governance and mission grades remain separate | eval harness | `HBR-01`, schema-validated `reward.json` + `grades.json` |
 | Secrets do not cross v2 state, output, child, migration, or eval boundaries | all modules + materializer | `G-13`, child-env tests, legacy quarantine cases, public-tree scan, allowlist manifest |
-| Harness claims match what was actually tested | eval harness + dogfood record | M4 manifests naming Agents Window, `cursor-cli`, and the env-auth Codex adapter separately |
-| A fresh machine reconstructs and transfers lease safely | distro + all modules | `H-01` local/CI exports, rejected concurrent claim, new epoch, answers, and admitted follow-up |
+| Harness claims match what was actually tested | eval harness + trial record | M4 manifests naming Agents Window, `cursor-cli`, and the env-auth Codex adapter separately |
+| A fresh machine reconstructs without liaison ownership | distro + all modules | New-agent continuation test (`H-01`) local/CI exports, new session record, answers, and admitted follow-up despite stale prior sessions |
+| Project state is navigable without harness memory | distro + State Tree + `watch` | Readable project state (M3) reconstruction skill, agent scenarios `D-01`/`D-02`, five continuation answers from journal/tree only |
+| Liaison supervises; workers execute inside a membrane | distro + adapters | Real workers (M4) hands-on trial + Harbor adapter lanes; work-order integrity rubric |
 | Cutover closes legacy authority without losing a rollback boundary | migration + release process | reconciliation events, non-approvable legacy evidence, rollback artifact, point-of-no-return record |
 
 ## Risks held throughout implementation
@@ -787,7 +877,7 @@ publish gate is green against the migrated state format.
 | --- | --- |
 | Level-1 gates are described as a sandbox | Explicit cooperative assurance language; direct journal tampering is out of scope until level 2 |
 | A rejected gate disappears in rollback | Rejection commits before exit 1; `G-03` and injected-fault tests |
-| Maintenance or claim candidacy becomes a permanent bypass | Separate non-mission roles, quiesced/vacant-root preconditions, typed events, privilege-crossing denials |
+| Maintenance becomes a permanent bypass | Separate non-mission role, quiesced-root preconditions, typed events, privilege-crossing denials |
 | Old history falsely fails new invariants | Migration boundary/snapshot; checks apply v2 envelope rules only afterward |
 | Migration damages or silently re-authorizes live state | Actual v1/v2 fixtures, backup, staged blobs plus final transaction, epoch closure/reconciliation, integrity checks, no dual writers |
 | Legacy artifacts are missing, secret-bearing, fabricated, or path-dependent | Scan + safe CAS ingestion, nonexportable quarantine, explicit missing records, paths retained as history only |
@@ -799,7 +889,7 @@ publish gate is green against the migrated state format.
 | Harbor build context leaks local data | Explicit content allowlist, content-addressed materialization, privacy scan, ignored run dirs |
 | Provider auth is materialized by a third-party adapter | Env-auth eval adapter for Codex; env allowlists, teardown, artifact/leak checks |
 | Judge scores are noisy or reward-hacked | Human-labeled calibration, named dimensions, repeated trials, preserved agent/verifier trajectories |
-| Cursor UI and Cursor CLI evidence are conflated | Separate native dogfood and Harbor adapter lanes with exact version manifests |
+| Cursor UI and Cursor CLI evidence are conflated | Separate native hands-on trial and Harbor adapter lanes with exact version manifests |
 | Tokens leak through nested metadata or activation | Source-only activation, environment-only reads, recursive validation and cross-surface leak tests |
 | Generated State Tree becomes shadow truth | Source-event stamps, read-only generated files by convention, divergence checks, deterministic regeneration |
 | Export combines inconsistent live files and journal state | Backup high-water, backup-derived projections, referenced-blob closure, authored-file stability pass, verified atomic bundle manifest |
@@ -807,8 +897,6 @@ publish gate is green against the migrated state format.
 
 ## Deferred, not lost
 
-- **Multi-session liaison (ADR 0001):** revisit only if dogfood shows singleton lease exclusivity is
-  the blocker. It would become Harness Sessions as State Tree objects plus delivery gates.
 - **Level-2 physical enforcement:** a separate OS principal owns the journal and modules become the
   only writable surface. Domain events and protocols should not change.
 - **Provider quotas and additional harness adapters:** add as nonconstitutional adapters and distro
@@ -819,7 +907,9 @@ publish gate is green against the migrated state format.
 ## Definition of done
 
 Delete every agent session, kill every process, and give a clean checkout plus the portable export
-to a fresh harness on a different machine. It can determine what is running, blocked, decided and
-why, verified, and approvable. It can continue through the distro, and no canonical transition in
-the complete suite was applied without a journaled admit. The post-cutover repository exposes one
-substrate, every requirement above has its named evidence, and all publish gates are green.
+to a fresh harness on a different machine. Using only the distro, journal, and State Tree, it can
+determine what is running, blocked, decided and why, verified, and approvable. It authors its own
+`LS-*` session record, and no canonical transition in the complete suite was applied without a
+journaled admit. Harness-private memory is unnecessary for that continuation. The post-cutover
+repository exposes one substrate, every requirement above has its named evidence, and all publish
+gates are green.

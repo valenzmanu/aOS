@@ -131,17 +131,17 @@ MIGRATION_OPERATION_PATTERN = re.compile(r"OP-[A-Z0-9][A-Z0-9_-]{1,124}\Z")
 MIGRATION_INVOKER_PATTERN = re.compile(r"maintenance:[A-Za-z0-9][A-Za-z0-9._-]{0,95}\Z")
 OPERATION_ACTION_PATTERN = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+\Z")
 PUBLIC_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}\Z")
+LIAISON_SESSION_PATTERN = re.compile(r"LS-[A-Za-z0-9][A-Za-z0-9._-]{1,124}\Z")
 INVOKER_KINDS = {
     "eval_fixture",
     "liaison",
-    "liaison_candidate",
     "maintenance_operator",
     "migration",
     "module",
     "reconciler",
     "worker",
 }
-AUTHORITY_BEARING_INVOKERS = {"liaison", "worker"}
+AUTHORITY_BEARING_INVOKERS = {"worker"}
 SECRET_ASSIGNMENT_PATTERN = re.compile(
     r"""(?ix)
     ["']?([a-z][a-z0-9_.-]{1,63})["']?
@@ -2309,6 +2309,8 @@ def _create_v2_core_tables(db: sqlite3.Connection) -> None:
         )
         """
     )
+    # Schema-4 compatibility only. Resident liaison sessions never insert
+    # authority epochs, so this historical index has no admission semantics.
     db.execute(
         """
         CREATE UNIQUE INDEX authority_epochs_one_active_liaison
@@ -4583,6 +4585,11 @@ def _normalized_operation_request(
     _required_public_identifier(invoker.id, "invoker id")
     if invoker.authority_epoch_id is not None:
         _required_public_identifier(invoker.authority_epoch_id, "authority epoch id")
+    if invoker.kind == "liaison":
+        if LIAISON_SESSION_PATTERN.fullmatch(invoker.id) is None:
+            raise InvalidOperation("liaison invoker id must use the LS-<session> form")
+        if invoker.authority_epoch_id is not None:
+            raise InvalidOperation("liaison invokers must not carry an authority epoch")
     if (invoker.on_behalf_of is None) != (invoker.decision_source_hash is None):
         raise InvalidOperation(
             "human attribution requires both on_behalf_of and decision_source_hash"
@@ -4646,7 +4653,7 @@ def _normalized_operation_request(
             "invoker": {
                 "authority_epoch_id": invoker.authority_epoch_id,
                 "decision_source_hash": invoker.decision_source_hash,
-                "id": invoker.id,
+                "id": "resident-liaison" if invoker.kind == "liaison" else invoker.id,
                 "kind": invoker.kind,
                 "on_behalf_of": invoker.on_behalf_of,
             },
@@ -5297,6 +5304,81 @@ def append_observation(
             payload,
             severity=severity,
         )
+
+    return _run_governed(
+        root,
+        request,
+        validator=validator,
+        projector=projector,
+        clock=clock,
+    )
+
+
+def retire_historical_liaison_authority(
+    root: Path,
+    request: OperationRequest,
+    *,
+    clock: Callable[[], datetime] = utc_now,
+) -> OperationOutcome:
+    """Close pre-cutover liaison epochs without creating replacement authority.
+
+    This is an explicit, replay-safe semantic migration for schema-4 roots that
+    used the removed liaison-claim surface. New resident liaison sessions do not
+    depend on this cleanup and remain unblocked even before it runs.
+    """
+
+    expected_ids = tuple(
+        item.aggregate_id
+        for item in request.expected_revisions
+        if item.aggregate_type == "authority_epoch" and item.role == "write"
+    )
+
+    def validator(context: _OperationValidationContext) -> GateRejection | None:
+        if (
+            request.action != "journal.retire_liaison_authority"
+            or request.invoker.kind != "maintenance_operator"
+            or request.invoker.authority_epoch_id is not None
+            or request.invoker.on_behalf_of is not None
+            or not expected_ids
+            or len(expected_ids) != len(request.expected_revisions)
+            or request.payload != {"epoch_ids": list(expected_ids)}
+        ):
+            return GateRejection("liaison_cutover_contract_rejected", {})
+        rows = context.db.execute(
+            f"""
+            SELECT epoch_id, kind, status
+            FROM authority_epochs
+            WHERE epoch_id IN ({",".join("?" for _ in expected_ids)})
+            ORDER BY epoch_id
+            """,
+            expected_ids,
+        ).fetchall()
+        if tuple(str(row[0]) for row in rows) != tuple(sorted(expected_ids)):
+            return GateRejection("liaison_cutover_epoch_missing", {})
+        if any(str(row[1]) != "liaison" or str(row[2]) != "active" for row in rows):
+            return GateRejection("liaison_cutover_epoch_not_active", {})
+        return None
+
+    def projector(context: _OperationContext) -> None:
+        for epoch_id in expected_ids:
+            event = context.append_event(
+                "authority.legacy_closed",
+                "authority_epoch",
+                epoch_id,
+                {
+                    "close_reason": "resident_liaison_cutover",
+                    "epoch_id": epoch_id,
+                },
+            )
+            context.db.execute(
+                """
+                UPDATE authority_epochs
+                SET status='closed', closed_at=?, closed_event_id=?,
+                    close_reason='resident_liaison_cutover'
+                WHERE epoch_id=? AND kind='liaison' AND status='active'
+                """,
+                (context.occurred_at, event.event_id, epoch_id),
+            )
 
     return _run_governed(
         root,

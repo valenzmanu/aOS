@@ -2,8 +2,8 @@
 
 E2E-00 asks one deliberately narrow question:
 
-> Can one fresh general-purpose agent, guided only by the checked-in distro and an explicit
-> activation, drive a durable mission from draft to delivered through constitutional CLI
+> Can one fresh general-purpose agent, resident in an aOS root and guided only by its checked-in
+> distro, drive a durable mission from draft to delivered through constitutional CLI
 > operations?
 
 This is the permanent end-to-end tracer for the first narrow v0 foundation. It intentionally does
@@ -20,16 +20,16 @@ UV_CACHE_DIR=/tmp/aos-uv-cache uv run python evals/v0/run.py
 The runner:
 
 1. creates a retained but disposable trial below `evals/.runs/`;
-2. copies the minimum v0 runtime sources, distro, objective, worker, and human decisions;
+2. copies the minimum v0 runtime sources, resident distro, objective, worker, and human decisions;
 3. initializes schema 4 and seeds `M-V0` with `aos-v0`;
 4. starts exactly one fresh Codex CLI `0.144.1` / `gpt-5.6-sol` process;
-5. gives that process `ACTIVATE.md` on stdin and performs no further lifecycle operation;
+5. gives that process only the mission task on stdin and performs no further lifecycle operation;
 6. retains the JSONL trajectory and final response; and
 7. grades the State Tree, immutable journal, evidence, approval, and command trajectory.
 
-The generated liaison capability exists only in the child-process environment. It is never put in
-a command argument, fixture, manifest, or retained output. If the value appears in captured output,
-the runner refuses to retain that output and fails.
+The nonsecret liaison session ID exists in the child-process environment and the agent authors its
+own session record before the first mission mutation. No liaison capability, lease, or exclusive
+claim exists.
 
 ## Expected path
 
@@ -57,6 +57,8 @@ operation.
   remote human identity.
 - The distro is intentionally tiny and scenario-specific. It is evidence about the architecture,
   not a claim that the broader aOS product is complete.
+- The tracer proves one resident liaison session and the governance suite proves concurrent
+  session semantics; it does not launch multiple real harnesses in one trial.
 - The trial relies on the locally authenticated Codex CLI. It does not test Cursor, provider
   failover, model quality distributions, retries, crashes, reconstruction, or multi-mission work.
 - This tracer and its constitutional path remain the regression baseline. Later milestones may
