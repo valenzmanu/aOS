@@ -27,6 +27,5 @@ evals/.runs/
 .aos-backups/
 
 # Local agent/editor state
-.lavish/
 .cursor/worktrees/
 .codex/local/
