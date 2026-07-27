@@ -42,6 +42,7 @@ from modules.protocol import (
     validate_approval_decision,
     validate_evidence_record,
 )
+from modules.runtime_paths import resolve_runtime_paths
 
 V0_LIAISON_SESSION_ID = "LS-V0"
 V0_ATTEMPT_ID = "A-V0"
@@ -1249,13 +1250,6 @@ def decide_mission(
     return outcome
 
 
-def _root_from_env(value: str | None, environment_name: str) -> Path:
-    selected = value or os.environ.get(environment_name)
-    if not selected:
-        raise InvalidOperation(f"{environment_name} is required")
-    return Path(selected)
-
-
 def _liaison_session_from_env(value: str | None) -> str:
     session_id = value or os.environ.get("AOS_LIAISON_SESSION_ID")
     if not session_id:
@@ -1338,8 +1332,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        root = _root_from_env(args.state_root, "AOS_STATE_ROOT")
-        missions_root = _root_from_env(args.missions_root, "AOS_MISSIONS_ROOT")
+        paths = resolve_runtime_paths(args.state_root, args.missions_root)
+        root = paths.state_root
+        missions_root = paths.missions_root
         if args.command == "init":
             result = initialize_v0(root, args.op)
         elif args.command == "setup":
