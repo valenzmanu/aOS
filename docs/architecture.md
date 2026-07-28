@@ -173,17 +173,23 @@ The phrase “aOS worktree” can hide two different lifecycles. Keep them disti
 | **Harness-managed chat worktree** | Codex defaults to `$CODEX_HOME/worktrees/<id>/aOS` | The harness, such as Codex | Isolate one chat or background task from the local checkout. |
 | **aOS-managed project or worker worktree** | `<installation_root>/projects/...` | The resident liaison following the mission protocol | Hold project execution associated with an admitted attempt or work order. |
 
-The runtime-path resolver supports entry from either class, but it does not create, retain, or
-delete worktrees.
+The resolver works directly only from the primary aOS checkout or a worktree linked to that aOS
+clone. A project or worker worktree belonging to another repository invokes mission commands
+through the primary installation:
+
+```bash
+uv --directory <installation_root> run aos-mission ...
+```
+
+The resolver does not create, retain, or delete either worktree class.
 
 ### Harness-managed chat worktrees
 
 Codex-managed worktrees are disposable execution locations. Codex creates them, associates them
-with chats, and applies its own retention policy. At the time of this guide, Codex deletes an
-eligible managed worktree when its chat is archived or when retention cleanup selects it. Active,
-pinned, and explicitly permanent worktrees are protected. Codex saves a restorable snapshot before
-deletion. Current product behavior is documented in
-[Codex worktrees](https://learn.chatgpt.com/docs/environments/git-worktrees).
+with chats, and applies its own retention policy. This lifecycle ownership is the architectural
+contract; the exact cleanup triggers and recovery behavior are non-normative product details that
+may change. Consult the current [Codex worktree
+documentation](https://learn.chatgpt.com/docs/environments/git-worktrees) before relying on them.
 
 aOS must not add a competing cleanup mechanism. It cannot know whether a chat is active, pinned,
 restorable, or still owns valuable uncommitted source changes.

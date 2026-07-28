@@ -104,7 +104,7 @@ Landed:
   delegation opt-in rather than default;
 - installation-wide runtime-root discovery that keeps one journal and State Tree across the
   primary checkout and linked Git worktrees while preserving explicit isolated roots; and
-- a live-proven, private aOS-first multi-root workspace for fresh Codex and Cursor sidebar
+- a documented, private aOS-first multi-root workspace for fresh Codex and Cursor sidebar
   liaisons, with project instructions read on demand and no global or injected bridge.
 
 The learning mission exposed reusable failures:

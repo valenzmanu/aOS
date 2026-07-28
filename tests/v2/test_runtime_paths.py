@@ -190,6 +190,29 @@ def test_paths_command_reports_shared_roots_from_linked_worktree(
     }
 
 
+def test_primary_and_linked_worktree_share_one_mission_controls_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    installation, linked_worktree = _linked_aos_installation(tmp_path)
+    monkeypatch.chdir(installation)
+
+    primary_exit_code = mission_main(["init", "--op", "OP-SHARED-CONTROLS-INIT"])
+    primary_result = json.loads(capsys.readouterr().out)
+
+    monkeypatch.chdir(linked_worktree)
+    linked_exit_code = mission_main(["init", "--op", "OP-SHARED-CONTROLS-INIT"])
+    linked_result = json.loads(capsys.readouterr().out)
+
+    assert primary_exit_code == 0
+    assert primary_result["status"] == "completed"
+    assert linked_exit_code == 0
+    assert linked_result["status"] == "replayed"
+    assert (installation / "state" / "aos.db").is_file()
+    assert not (linked_worktree / "state").exists()
+
+
 def test_primary_and_linked_worktree_share_one_v0_journal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
