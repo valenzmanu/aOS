@@ -27,7 +27,8 @@ requires explicit human decisions. It does not decide what work to do or orchest
 - **One clone has one private runtime.** The primary checkout owns `state/`, `missions/`, and
   `projects/`; linked worktrees discover those roots through Git instead of creating local copies.
 
-The architectural decision is [ADR 0002](docs/adr/0002-sparse-constitutional-agent-os.md). The
+Start with the self-contained [architecture guide](docs/architecture.md). The authoritative
+constitutional decision is [ADR 0002](docs/adr/0002-sparse-constitutional-agent-os.md), and the
 remaining build sequence and assurance claims are in the
 [implementation plan](docs/aos-v2-implementation-plan.md). aOS preserves durable mission work in
 the journal and State Tree; it does not replace harness memory.
@@ -126,7 +127,7 @@ evals/delegation/ paired parent-only/native-delegation proof
 evals/recovery/ agent-driven stalled-worker recovery proof
 evals/v0/      permanent agent-runtime vertical tracer
 tests/v2/      governance, protocol, migration, and tracer tests
-docs/          architecture decision and implementation plan
+docs/          self-contained architecture, decisions, plans, and evidence
 ```
 
 Archived schema fixtures remain only to prove deterministic migration. The legacy Python control

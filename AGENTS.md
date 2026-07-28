@@ -3,6 +3,7 @@
 Agents are the reasoning runtime. Files are their interface; the journal is canonical for
 contested mission truth; code exists only at demonstrated constitutional joints.
 
+Read `docs/architecture.md` for the system map, runtime ownership, and worktree lifecycles.
 Read `docs/adr/0002-sparse-constitutional-agent-os.md` and
 `docs/aos-v2-implementation-plan.md` before changing architecture.
 
