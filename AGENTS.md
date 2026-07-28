@@ -3,14 +3,25 @@
 Agents are the reasoning runtime. Files are their interface; the journal is canonical for
 contested mission truth; code exists only at demonstrated constitutional joints.
 
+Read `docs/architecture.md` for the system map, runtime ownership, and worktree lifecycles.
 Read `docs/adr/0002-sparse-constitutional-agent-os.md` and
 `docs/aos-v2-implementation-plan.md` before changing architecture.
 
 ## Operating mode
 
-- Every harness in this root is a non-exclusive resident liaison. Before its first governed
-  mission mutation, it creates a unique attribution record under
-  `state/liaison/sessions/LS-<session>/`; that record grants no authority and blocks nothing.
+- Every harness in this installation is a non-exclusive resident liaison. Before its first
+  governed mission mutation, it runs `uv run aos-mission paths` and creates a unique attribution
+  record under the returned `state_root` at `liaison/sessions/LS-<session>/`; that record grants
+  no authority and blocks nothing.
+- The primary checkout owns the installation-wide `state/`, `missions/`, and `projects/` roots.
+  Never create checkout-local runtime material in an aOS linked worktree.
+- For project-level editor work, keep the worktree and a sibling multi-root
+  `.code-workspace` private under the returned `projects_root`. Put the primary aOS
+  `installation_root` first and the project worktree second, so a fresh sidebar chat receives
+  current liaison instructions while retaining code access. Before editing project code, read the
+  project's own `AGENTS.md` hierarchy. Run mission commands as
+  `uv --directory <installation_root> run aos-mission ...`; do not inject or copy aOS instructions
+  into the project.
 - Perform ordinary repository work directly. Do not turn source edits into governed missions.
 - Keep goals, planning, routing, supervision, recovery, and retry judgment in agents—not
   `modules/`.

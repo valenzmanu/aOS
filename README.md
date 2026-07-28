@@ -24,8 +24,11 @@ requires explicit human decisions. It does not decide what work to do or orchest
 - **Residence establishes liaison behavior.** Reading the root distro is sufficient; contested
   changes still require revision-checked journal admission and explicit human provenance where
   required.
+- **One clone has one private runtime.** The primary checkout owns `state/`, `missions/`, and
+  `projects/`; linked worktrees discover those roots through Git instead of creating local copies.
 
-The architectural decision is [ADR 0002](docs/adr/0002-sparse-constitutional-agent-os.md). The
+Start with the self-contained [architecture guide](docs/architecture.md). The authoritative
+constitutional decision is [ADR 0002](docs/adr/0002-sparse-constitutional-agent-os.md), and the
 remaining build sequence and assurance claims are in the
 [implementation plan](docs/aos-v2-implementation-plan.md). aOS preserves durable mission work in
 the journal and State Tree; it does not replace harness memory.
@@ -80,6 +83,38 @@ and two scripted human decisions. The routing and delegation scenarios are learn
 new orchestration runtime. Live Cursor comparisons, generic verification, multi-mission operation,
 and the general distro remain later milestones.
 
+## Worktrees and editor sidebars
+
+Normal resident commands need no root environment variables. From the primary checkout or a linked
+aOS worktree containing this release, inspect the canonical private roots with:
+
+```bash
+uv run aos-mission paths
+```
+
+For an older linked branch, invoke the current primary installation with
+`uv --directory <installation_root> run aos-mission paths`.
+
+Explicit `--state-root` and `--missions-root` options, and their existing environment variables,
+remain available as a pair for isolated evals and recovery tools. A partial pair is rejected.
+If a linked worktree already contains non-empty checkout-local runtime roots, aOS fails closed
+instead of choosing or merging histories.
+
+The code-close editor bridge uses a project worktree and a sibling multi-root
+`.code-workspace` under the returned `projects_root`. It puts the primary aOS checkout first, so
+the sidebar starts with current liaison instructions, and the project worktree second, so its code
+remains accessible. Before editing code, the liaison reads the project's own instruction hierarchy.
+Mission commands run through the primary installation:
+
+```bash
+uv --directory <installation_root> run aos-mission paths
+```
+
+This private workspace supplies access to both roots without global skills or files injected into
+the project. Before the first governed mutation, verify a fresh sidebar chat received the current
+primary aOS instructions and can access the project worktree; filesystem access alone does not
+prove instruction loading.
+
 ## Repository
 
 ```text
@@ -92,7 +127,7 @@ evals/delegation/ paired parent-only/native-delegation proof
 evals/recovery/ agent-driven stalled-worker recovery proof
 evals/v0/      permanent agent-runtime vertical tracer
 tests/v2/      governance, protocol, migration, and tracer tests
-docs/          architecture decision and implementation plan
+docs/          self-contained architecture, decisions, plans, and evidence
 ```
 
 Archived schema fixtures remain only to prove deterministic migration. The legacy Python control
@@ -108,7 +143,8 @@ uv run python scripts/check_public_tree.py
 
 Runtime roots such as `state/`, `missions/`, and `projects/` can contain prompts, source excerpts,
 transcripts, and capability material. They are ignored by Git and must never be attached to public
-issues. Read [SECURITY.md](SECURITY.md) before operating on private repositories.
+issues. The primary checkout's ignored roots are canonical, so destructive ignored-file cleanup is
+unsafe there. Read [SECURITY.md](SECURITY.md) before operating on private repositories.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md). aOS is released under the
 [MIT License](LICENSE).

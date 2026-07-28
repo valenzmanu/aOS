@@ -47,6 +47,7 @@ from modules.protocol import (
     RetryKind,
     require_transition,
 )
+from modules.runtime_paths import RuntimePathError, resolve_runtime_paths
 
 REQUIRED_CONTRACT_HEADINGS = (
     "Outcome",
@@ -2187,13 +2188,6 @@ def _result_is_rejected(result: dict[str, object]) -> bool:
     )
 
 
-def _root_from_env(value: str | None, environment_name: str) -> Path:
-    selected = value or os.environ.get(environment_name)
-    if not selected:
-        raise InvalidOperation(f"{environment_name} is required")
-    return Path(selected)
-
-
 def _liaison_session_from_env(value: str | None) -> str:
     session_id = value or os.environ.get("AOS_LIAISON_SESSION_ID")
     if not session_id:
@@ -2214,6 +2208,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--missions-root")
     parser.add_argument("--liaison-session")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("paths")
 
     init = subparsers.add_parser("init")
     init.add_argument("--op", default="OP-MC-INIT")
@@ -2271,9 +2267,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        root = _root_from_env(args.state_root, "AOS_STATE_ROOT")
-        missions_root = _root_from_env(args.missions_root, "AOS_MISSIONS_ROOT")
-        if args.command == "init":
+        paths = resolve_runtime_paths(args.state_root, args.missions_root)
+        root = paths.state_root
+        missions_root = paths.missions_root
+        if args.command == "paths":
+            result = {
+                "installation_root": (
+                    str(paths.installation_root) if paths.installation_root else None
+                ),
+                "missions_root": str(paths.missions_root),
+                "projects_root": str(paths.projects_root) if paths.projects_root else None,
+                "source": paths.source,
+                "state_root": str(paths.state_root),
+            }
+        elif args.command == "init":
             result = initialize_controls(root, args.op)
         elif args.command == "intake":
             session_id = _liaison_session_from_env(args.liaison_session)
@@ -2386,10 +2393,12 @@ def main(argv: list[str] | None = None) -> int:
                 result.update(mission_status(root, missions_root, args.mission_id))
         else:
             result = mission_status(root, missions_root, args.mission_id)
-    except InvalidOperation as exc:
+    except (InvalidOperation, RuntimePathError) as exc:
         print(json.dumps({"reason": str(exc), "status": "error"}, sort_keys=True))
         return 2
     print(json.dumps(result, sort_keys=True))
+    if args.command == "paths":
+        return 0
     if args.command == "status":
         return 0 if result.get("state") is not None else 1
     if result.get("status") in {"completed", "replayed"} and not _result_is_rejected(result):

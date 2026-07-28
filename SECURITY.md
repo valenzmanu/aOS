@@ -32,6 +32,12 @@ Do not attach those directories to bug reports. Produce a minimal reproduction u
 data and the deterministic worker fixture. Run `uv run python scripts/check_public_tree.py` before
 publishing.
 
+The primary aOS checkout owns the canonical ignored runtime roots for all of its linked worktrees.
+Do not run forced ignored-file cleanup such as `git clean -fdx` in that installation. Treat
+absolute paths printed by `aos-mission paths` as private local data, and never copy them into public
+evidence. If a linked worktree contains its own non-empty runtime roots, reconcile them manually;
+aOS deliberately will not merge or delete a possibly divergent journal.
+
 ## Threat-model limits
 
 - Worker and process capabilities are bearer credentials. Protect the environment of active

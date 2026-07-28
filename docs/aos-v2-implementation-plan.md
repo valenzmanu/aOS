@@ -96,12 +96,16 @@ Landed:
 - a same-work recovery joint that atomically closes a stalled worker session and authority, resets
   its process from `running` to `created`, and creates a fresh session and authority epoch without
   changing the attempt, process, work order, or worktree;
-- removal of the legacy Python orchestration runtime.
+- removal of the legacy Python orchestration runtime;
 - portable agent-authored routing and native-delegation protocols;
 - thin, credential-filtering Codex and Cursor worker adapters;
-- a passing layered-routing agent eval and deterministic four-cell launch contract; and
+- a passing layered-routing agent eval and deterministic four-cell launch contract;
 - three passing paired Codex delegation calibrations whose measured overhead keeps native
-  delegation opt-in rather than default.
+  delegation opt-in rather than default;
+- installation-wide runtime-root discovery that keeps one journal and State Tree across the
+  primary checkout and linked Git worktrees while preserving explicit isolated roots; and
+- a documented, private aOS-first multi-root workspace for fresh Codex and Cursor sidebar
+  liaisons, with project instructions read on demand and no global or injected bridge.
 
 The learning mission exposed reusable failures:
 
@@ -110,6 +114,7 @@ The learning mission exposed reusable failures:
 - verifier output must not echo attacker-controlled values or private paths;
 - verification replay must use recorded immutable evidence rather than mutable files;
 - Git subprocesses need an explicit isolated environment;
+- ignored checkout-relative runtime roots split canonical mission truth across linked worktrees;
 - a stalled worker needs an honest close-and-replace path, not automatic orchestration.
 
 The landing page and its mission dossier were disposable discovery artifacts. Their product output
